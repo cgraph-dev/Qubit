@@ -7,7 +7,7 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Python version
         run: python3 --version
       - name: Compile the runtime
@@ -23,7 +23,7 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Require Python >= 3.12
         run: |
           python3 - <<'PY'
@@ -45,7 +45,7 @@ jobs:
             --require-clean --report dist/artifact-install-e2e.json
       - name: Upload the artifact-install report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: artifact-install-e2e-report
           path: dist/artifact-install-e2e.json
