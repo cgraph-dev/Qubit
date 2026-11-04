@@ -1,0 +1,32 @@
+name: Blob Size Check
+
+# Rejects PRs that add or modify a binary over 500 KiB, or add any new file
+# over 500 KiB. Every blob a merge adds stays in every clone forever, even
+# after a later commit deletes it. Exact-path exceptions live in
+# .github/blob-size-allowlist.txt (CODEOWNERS-reviewed).
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: blob-size-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check-blob-size:
+    name: Reject large binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # The merge commit and its first parent (the base branch tip).
+          fetch-depth: 2
+      - name: Judge files added or modified against the base branch tip
+        run: python3 qubit_runtime/scripts/ci/check_blob_size.py --base HEAD^1
