@@ -1,0 +1,16 @@
+{
+  "name": "qubit-office",
+  "label": "Qubit Office",
+  "description": "Qubit Office — the agent corporation as a place you can walk: floors, rooms, desks and characters that animate only from office_event rows (C7). Reads /api/office/tower, the same store `qubit office` writes.",
+  "icon": "Users",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/qubit-office",
+    "hidden": true,
+    "position": "end"
+  },
+  "entry": "qubit-office.game.js",
+  "css": "qubit-office.game.css",
+  "has_api": true,
+  "source": "qubit-overlay"
+}

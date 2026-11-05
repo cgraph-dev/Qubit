@@ -1,0 +1,864 @@
+"""Orb STOP -> helper spoke-reply playback stops (9u).
+
+Root cause of the owner's "stop is too slow": the helper blocks in
+``_play_with_barge_in`` for the whole reply and the orb's stop press only
+cancelled the *staged request* (``VoiceEditService.cancel``), never the
+player subprocess. This pins the explicit stop path:
+
+- ``DesktopHelper.stop_speaking`` terminates the live player and sets
+  ``_barge_interrupted``; the owning ``_speak`` emits the canonical
+  ``interrupt`` / ``playback.stopped`` / ``response.done`` events, so the
+  orb's FSM ends at once. It works with barge-in enabled OR disabled.
+- SIGUSR2 -> ``on_orb_stop`` is the orb seam (SIGUSR1 still toggles capture).
+- ``OrbClient.stop_speaking`` sends SIGUSR2 to the cmdline-validated helper
+  pid and refuses a foreign one.
+- ``VoiceEditService.cancel`` best-effort signals the helper, so a cancel
+  is never a no-op for audio, while keeping its signature/shape stable.
+
+Hermetic: no X, no mic, no audio, no model. Fakes stand in for the player,
+mic and OS signal delivery.
+"""
+from __future__ import annotations
+
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import voicebridge.desktop_helper as dh
+from voicebridge.orb import client as orb_client
+from voicebridge.voice_edit.schema import InsertionResult, SelectionSnapshot
+from voicebridge.voice_edit.service import VoiceEditService
+from voicebridge.voice_edit.transform import TransformEngine
+
+
+# ---------------------------------------------------------------------------
+# shared fakes
+# ---------------------------------------------------------------------------
+class FakeCfg:
+    def __init__(self, data=None):
+        self._data = data or {}
+
+    def get(self, *path, default=None):
+        node = self._data
+        for p in path:
+            if isinstance(node, dict) and p in node:
+                node = node[p]
+            else:
+                return default
+        return node
+
+
+def _cfg(**ve):
+    base = {"enabled": True, "speak_answers": True}
+    base.update(ve)
+    return FakeCfg({"voice_edit": base})
+
+
+class FakeOverlay:
+    def __init__(self):
+        self.statuses = []
+
+    def set_status(self, state, detail=""):
+        self.statuses.append((state, detail))
+
+    def show_preview(self, payload):
+        pass
+
+    def show_error(self, code, detail):
+        pass
+
+    def append_history(self, line):
+        pass
+
+
+class FakeDesktop:
+    def session(self):
+        return {"session_type": "x11", "x11": True}
+
+    def _tool(self, name):
+        return False
+
+    def is_fullscreen(self, wid=""):
+        return False
+
+
+class FakeClient:
+    def __init__(self, wav=b"RIFF" + b"\x00" * 64):
+        self._wav = wav
+
+    def speak(self, text):
+        return self._wav
+
+
+class FakeMic:
+    """Never yields a confident frame; blocks the barge loop until stopped."""
+
+    frame_ms = 300
+
+    def __init__(self):
+        self.started = False
+        self.stopped = False
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.stopped = True
+
+    def read_frame(self, timeout=0.5):
+        time.sleep(0.01)
+        return None
+
+
+class StopProc:
+    """Player that stays alive until terminated/killed (real Popen shape)."""
+
+    def __init__(self):
+        self.alive = True
+        self.terminated = False
+        self.killed = False
+
+    def poll(self):
+        return None if self.alive else 0
+
+    def terminate(self):
+        self.terminated = True
+        self.alive = False
+
+    def kill(self):
+        self.killed = True
+        self.alive = False
+
+    def wait(self, timeout=None):
+        if self.alive:
+            raise subprocess.TimeoutExpired(cmd="paplay", timeout=timeout or 0)
+        return 0
+
+
+class SelfEndingProc(StopProc):
+    """Player that finishes after a few polls, like a short real reply."""
+
+    def __init__(self, polls=3):
+        super().__init__()
+        self._left = polls
+
+    def poll(self):
+        if not self.alive:
+            return 0
+        self._left -= 1
+        if self._left <= 0:
+            self.alive = False
+            return 0
+        return None
+
+    def wait(self, timeout=None):
+        return 0
+
+
+def _helper(monkeypatch, cfg, mic, procs, proc_cls=StopProc):
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/paplay")
+
+    class FakePopen:
+        def __init__(self, argv, **kw):
+            self._inner = proc_cls()
+            procs.append(self._inner)
+
+        def poll(self):
+            return self._inner.poll()
+
+        def terminate(self):
+            self._inner.terminate()
+
+        def kill(self):
+            self._inner.kill()
+
+        def wait(self, timeout=None):
+            return self._inner.wait(timeout=timeout)
+
+    monkeypatch.setattr("subprocess.Popen", FakePopen)
+    h = dh.DesktopHelper(cfg, client=FakeClient(),
+                         overlay=FakeOverlay(),
+                         desktop=FakeDesktop(),
+                         mic_factory=lambda: mic)
+    h._warm_event.set()
+    h._warm_state = "skipped"
+    return h
+
+
+def _speak_in_thread(helper, text):
+    t = threading.Thread(target=helper._speak, args=(text,), daemon=True)
+    t.start()
+    deadline = time.time() + 3.0
+    while time.time() < deadline and helper._playback_proc is None:
+        time.sleep(0.005)
+    assert helper._playback_proc is not None, "playback never started"
+    return t
+
+
+def _event_types(helper):
+    return [e.get("type") for e in helper.talk_events()]
+
+
+# ---------------------------------------------------------------------------
+# helper: explicit stop terminates playback + emits the stop events
+# ---------------------------------------------------------------------------
+def test_stop_speaking_barge_in_enabled_terminates_and_emits(monkeypatch):
+    mic = FakeMic()
+    procs = []
+    h = _helper(monkeypatch, _cfg(barge_in_threshold=0.20), mic, procs)
+    t = _speak_in_thread(h, "hello there this is a long spoken reply indeed")
+    assert h.stop_speaking() is True
+    t.join(timeout=3.0)
+    assert not t.is_alive()
+    assert procs and procs[0].terminated is True
+    assert h._speaking is False
+    assert h._barge_interrupted is True
+    types = _event_types(h)
+    assert "interrupt" in types
+    assert "playback.stopped" in types
+    assert "response.done" in types
+
+
+def test_stop_speaking_barge_in_disabled_still_terminates(monkeypatch):
+    mic = FakeMic()
+    procs = []
+    h = _helper(monkeypatch, _cfg(barge_in=False), mic, procs)
+    t = _speak_in_thread(h, "hello there this is a long spoken reply indeed")
+    assert h.stop_speaking() is True
+    t.join(timeout=3.0)
+    assert not t.is_alive()
+    assert procs and procs[0].terminated is True
+    assert mic.started is False, "disabled barge-in must not open the mic"
+
+
+def test_stop_speaking_noop_when_idle_keeps_state(monkeypatch):
+    mic = FakeMic()
+    h = _helper(monkeypatch, _cfg(), mic, [])
+    before = _event_types(h)
+    assert h.stop_speaking() is False
+    assert h._speaking is False
+    assert _event_types(h) == before, "idle stop must emit nothing"
+
+
+def test_stop_speaking_terminate_error_is_swallowed(monkeypatch):
+    h = _helper(monkeypatch, _cfg(), FakeMic(), [])
+
+    class BadProc:
+        def terminate(self):
+            raise OSError("device gone")
+
+    h._speaking = True
+    h._playback_proc = BadProc()
+    assert h.stop_speaking() is True  # best-effort, reported as requested
+    h._speaking = False
+    h._playback_proc = None
+
+
+def test_on_orb_stop_calls_stop_speaking(monkeypatch):
+    h = _helper(monkeypatch, _cfg(), FakeMic(), [])
+    calls = []
+    monkeypatch.setattr(h, "stop_speaking",
+                        lambda: (calls.append(True), True)[1])
+    h.on_orb_stop()
+    assert calls == [True]
+
+
+def test_normal_playback_unaffected_after_failed_stop(monkeypatch):
+    # A stop with nothing playing must leave the next reply intact.
+    mic = FakeMic()
+    procs = []
+    h = _helper(monkeypatch, _cfg(barge_in=False), mic, procs,
+                proc_cls=SelfEndingProc)
+    assert h.stop_speaking() is False
+    h._speak_stop.clear()
+    h._speak("a short spoken reply")
+    assert procs and procs[0].terminated is False
+    assert h._barge_interrupted is False
+
+
+# ---------------------------------------------------------------------------
+# helper: SIGUSR2 wiring (distinct from the SIGUSR1 capture toggle)
+# ---------------------------------------------------------------------------
+def test_signal_handlers_install_sigusr1_and_sigusr2(monkeypatch):
+    h = _helper(monkeypatch, _cfg(), FakeMic(), [])
+    installed = {}
+    monkeypatch.setattr(signal, "signal",
+                        lambda sig, fn: installed.__setitem__(sig, fn))
+    h._install_orb_signal_handlers()
+    assert signal.SIGUSR1 in installed
+    assert signal.SIGUSR2 in installed
+    assert callable(installed[signal.SIGUSR1])
+    assert callable(installed[signal.SIGUSR2])
+
+
+def test_shutdown_restores_sigusr2_handler(monkeypatch):
+    h = _helper(monkeypatch, _cfg(), FakeMic(), [])
+    restored = {}
+    monkeypatch.setattr(signal, "signal",
+                        lambda sig, fn: restored.__setitem__(sig, fn))
+    sentinel1, sentinel2 = object(), object()
+    h._orb_prev_sigusr1 = sentinel1
+    h._orb_prev_sigusr2 = sentinel2
+    h.shutdown()
+    assert restored.get(signal.SIGUSR1) is sentinel1
+    assert restored.get(signal.SIGUSR2) is sentinel2
+
+
+# ---------------------------------------------------------------------------
+# orb client: stop_speaking signals the validated helper pid (SIGUSR2)
+# ---------------------------------------------------------------------------
+def test_orb_client_stop_speaking_signals_helper(monkeypatch):
+    sent = {}
+
+    def fake_kill(pid, sig):
+        sent["pid"] = pid
+        sent["sig"] = sig
+
+    monkeypatch.setattr("voicebridge.orb.client._helper_heartbeat",
+                        lambda: {"schema": "qubit-voice-edit-helper/1",
+                                 "pid": 123456})
+    monkeypatch.setattr("voicebridge.orb.client._helper_cmdline",
+                        lambda pid: "python -m voicebridge.desktop_helper")
+    monkeypatch.setattr(os, "kill", fake_kill)
+    cli = orb_client.OrbClient("http://127.0.0.1:8890", "t")
+    out = cli.stop_speaking()
+    assert out["ok"] is True
+    assert sent == {"pid": 123456, "sig": signal.SIGUSR2}
+
+
+def test_orb_client_stop_speaking_refuses_foreign_pid(monkeypatch):
+    sent = []
+    monkeypatch.setattr("voicebridge.orb.client._helper_heartbeat",
+                        lambda: {"schema": "qubit-voice-edit-helper/1",
+                                 "pid": 99999})
+    monkeypatch.setattr("voicebridge.orb.client._helper_cmdline",
+                        lambda pid: "firefox --browser")
+    monkeypatch.setattr(os, "kill", lambda pid, sig: sent.append(pid))
+    cli = orb_client.OrbClient("http://127.0.0.1:8890", "t")
+    try:
+        cli.stop_speaking()
+    except orb_client.OrbError as exc:
+        assert exc.code == "ORB_HELPER_NOT_RUNNING"
+    else:
+        raise AssertionError("foreign pid must be refused")
+    assert sent == []
+
+
+def test_orb_client_stop_speaking_no_helper(monkeypatch):
+    monkeypatch.setattr("voicebridge.orb.client._helper_heartbeat",
+                        lambda: None)
+    cli = orb_client.OrbClient("http://127.0.0.1:8890", "t")
+    try:
+        cli.stop_speaking()
+    except orb_client.OrbError as exc:
+        assert exc.code == "ORB_HELPER_NOT_RUNNING"
+    else:
+        raise AssertionError("absent helper must raise typed error")
+
+
+# ---------------------------------------------------------------------------
+# service: cancel best-effort stops the spoken reply, shape unchanged
+# ---------------------------------------------------------------------------
+class SvcDesktop:
+    def session(self):
+        return {"session_type": "x11", "x11": True}
+
+    def _tool(self, name):
+        return name in ("xdotool", "xclip")
+
+    def is_fullscreen(self, wid=""):
+        return False
+
+    def capture_selection(self, cfg=None):
+        return SelectionSnapshot(available=True, text="hello world",
+                                 char_count=11, app_class="code", window_id="42")
+
+    def insert_text(self, text, snapshot, cfg=None, *, method=""):
+        return InsertionResult(ok=True, method="clipboard_paste")
+
+    def revert_last(self, snapshot, cfg=None):
+        return InsertionResult(ok=True, method="undo")
+
+
+def _service():
+    svc = VoiceEditService(
+        _cfg(routing="local", confirm_before_replace=False),
+        desktop=SvcDesktop(),
+        engine=TransformEngine(runner=lambda *a, **k: None),
+        audit=lambda *a: None, estop=lambda cfg: False)
+    return svc
+
+
+def test_service_cancel_signals_helper_stop(monkeypatch):
+    from voicebridge.voice_edit import service as svc_mod
+    calls = []
+    monkeypatch.setattr(svc_mod, "_signal_helper_stop",
+                        lambda: (calls.append(True), True)[1])
+    svc = _service()
+    rid = svc.begin()["request_id"]
+    out = svc.cancel(rid)
+    assert out["cancelled"] is True
+    assert calls == [True]
+
+
+def test_service_cancel_unknown_still_signals(monkeypatch):
+    from voicebridge.voice_edit import service as svc_mod
+    calls = []
+    monkeypatch.setattr(svc_mod, "_signal_helper_stop",
+                        lambda: (calls.append(True), True)[1])
+    svc = _service()
+    out = svc.cancel("does-not-exist")
+    assert out["cancelled"] is False
+    assert calls == [True], "cancel must not be a no-op for audio"
+
+
+def test_signal_helper_stop_validated_pid(monkeypatch):
+    from voicebridge.voice_edit import service as svc_mod
+    import voicebridge.voice_edit.heartbeat as hb
+    monkeypatch.setattr(hb, "other_live_pid", lambda exclude=0: 4242)
+    sent = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: sent.append((pid, sig)))
+    assert svc_mod._signal_helper_stop() is True
+    assert sent == [(4242, signal.SIGUSR2)]
+
+
+def test_signal_helper_stop_no_helper_is_false(monkeypatch):
+    from voicebridge.voice_edit import service as svc_mod
+    import voicebridge.voice_edit.heartbeat as hb
+    monkeypatch.setattr(hb, "other_live_pid", lambda exclude=0: None)
+    sent = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: sent.append(pid))
+    assert svc_mod._signal_helper_stop() is False
+    assert sent == []
+
+
+def test_signal_helper_stop_kill_error_is_false(monkeypatch):
+    from voicebridge.voice_edit import service as svc_mod
+    import voicebridge.voice_edit.heartbeat as hb
+
+    def boom(pid, sig):
+        raise OSError("gone")
+
+    monkeypatch.setattr(hb, "other_live_pid", lambda exclude=0: 7)
+    monkeypatch.setattr(os, "kill", boom)
+    assert svc_mod._signal_helper_stop() is False
+
+
+# ---------------------------------------------------------------------------
+# stop while THINKING/WORKING (before TTS starts) suppresses the pending reply
+# ---------------------------------------------------------------------------
+class TurnClient(FakeClient):
+    """Routes to an ``answer`` turn; ``ask_result`` can block on a gate.
+
+    ``gate`` is the blocker held while the turn is PROCESSING so a test can
+    deliver a STOP before the reply reaches ``_speak``.
+    """
+
+    def __init__(self, answer="Here is the full spoken answer.", *, gate=None):
+        super().__init__()
+        self.answer = answer
+        self._gate = gate
+        self.entered = threading.Event()
+        self.asked = []
+
+    def status(self):
+        return {"enabled": True, "estop": False}
+
+    def begin(self):
+        return {"ok": True, "request_id": "req-1"}
+
+    def route(self, rid, text):
+        return {"ok": True, "mode": "answer", "question": text}
+
+    def ask_result(self, question, request_id):
+        self.asked.append(question)
+        self.entered.set()
+        if self._gate is not None:
+            self._gate.wait(timeout=5.0)
+        return {"answer": self.answer}
+
+
+class SynthGateClient(TurnClient):
+    """Blocks inside ``speak`` so a STOP can land during synthesis."""
+
+    def __init__(self, answer="Here is the full spoken answer."):
+        super().__init__(answer)
+        self.synth_entered = threading.Event()
+        self.synth_release = threading.Event()
+
+    def speak(self, text):
+        self.synth_entered.set()
+        self.synth_release.wait(timeout=5.0)
+        return super().speak(text)
+
+
+def _turn_helper(monkeypatch, client, *, barge_in=True):
+    procs = []
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/paplay")
+
+    class FakePopen:
+        def __init__(self, argv, **kw):
+            self._inner = SelfEndingProc()
+            procs.append(self._inner)
+
+        def poll(self):
+            return self._inner.poll()
+
+        def terminate(self):
+            self._inner.terminate()
+
+        def kill(self):
+            self._inner.kill()
+
+        def wait(self, timeout=None):
+            return self._inner.wait(timeout=timeout)
+
+    monkeypatch.setattr("subprocess.Popen", FakePopen)
+    h = dh.DesktopHelper(_cfg(barge_in=barge_in), client=client,
+                         overlay=FakeOverlay(), desktop=FakeDesktop(),
+                         mic_factory=lambda: FakeMic())
+    h._warm_event.set()
+    h._warm_state = "skipped"
+    return h, procs
+
+
+def _run_turn(h, text):
+    t = threading.Thread(target=h._process_transcript, args=(text,), daemon=True)
+    t.start()
+    return t
+
+
+def test_stop_while_processing_suppresses_the_pending_reply(monkeypatch):
+    gate = threading.Event()
+    client = TurnClient(answer="This reply must never be heard.", gate=gate)
+    h, procs = _turn_helper(monkeypatch, client)
+    t = _run_turn(h, "what is the time")
+    assert client.entered.wait(timeout=3.0), "turn never reached the brain"
+    assert h.state == h.PROCESSING
+    # The whole point: a STOP here must not be a silent no-op.
+    assert h.stop_speaking() is True
+    gate.set()
+    t.join(timeout=3.0)
+    assert not t.is_alive()
+    assert procs == [], "a stopped turn must not play the reply"
+    assert h._speaking is False
+    types = _event_types(h)
+    assert "interrupt" in types
+    assert "playback.stopped" in types
+    assert "response.done" in types
+    assert "playback.started" not in types, "nothing was ever played"
+
+
+def test_stop_while_processing_works_with_barge_in_disabled(monkeypatch):
+    gate = threading.Event()
+    client = TurnClient(answer="Suppressed even without barge-in.", gate=gate)
+    h, procs = _turn_helper(monkeypatch, client, barge_in=False)
+    t = _run_turn(h, "another question")
+    assert client.entered.wait(timeout=3.0)
+    assert h.stop_speaking() is True
+    gate.set()
+    t.join(timeout=3.0)
+    assert procs == []
+    assert "interrupt" in _event_types(h)
+
+
+def test_stop_during_synthesis_suppresses_playback(monkeypatch):
+    client = SynthGateClient(answer="Synth-gated reply.")
+    h, procs = _turn_helper(monkeypatch, client)
+    t = _run_turn(h, "synthesize this")
+    assert client.synth_entered.wait(timeout=3.0), "synth never started"
+    assert h.state == h.PROCESSING
+    assert h.stop_speaking() is True
+    client.synth_release.set()
+    t.join(timeout=3.0)
+    assert procs == [], "a mid-synthesis stop must not start playback"
+    types = _event_types(h)
+    assert "interrupt" in types and "response.done" in types
+
+
+def test_idle_stop_does_not_suppress_the_next_reply(monkeypatch):
+    client = TurnClient(answer="A normal spoken reply.")
+    h, procs = _turn_helper(monkeypatch, client)
+    assert h.state == h.IDLE
+    assert h.stop_speaking() is False, "idle stop is a scoped no-op"
+    _run_turn(h, "hello there").join(timeout=3.0)
+    assert procs, "the next reply must still play after an idle stop"
+    assert h._barge_interrupted is False
+
+
+def test_new_turn_after_a_processing_stop_speaks_normally(monkeypatch):
+    gate = threading.Event()
+    client = TurnClient(answer="First reply.", gate=gate)
+    h, procs = _turn_helper(monkeypatch, client)
+    t = _run_turn(h, "first question")
+    assert client.entered.wait(timeout=3.0)
+    assert h.stop_speaking() is True
+    gate.set()
+    t.join(timeout=3.0)
+    assert procs == [], "first turn was stopped"
+    # A fresh turn is a new epoch: the stop must not leak into it.
+    h.client = TurnClient(answer="Second reply.")
+    _run_turn(h, "second question").join(timeout=3.0)
+    assert procs, "a fresh turn after a stop must speak"
+
+
+def test_repeated_processing_stop_emits_once(monkeypatch):
+    gate = threading.Event()
+    client = TurnClient(answer="One emission only.", gate=gate)
+    h, procs = _turn_helper(monkeypatch, client)
+    t = _run_turn(h, "stop me twice")
+    assert client.entered.wait(timeout=3.0)
+    assert h.stop_speaking() is True
+    assert h.stop_speaking() is True
+    gate.set()
+    t.join(timeout=3.0)
+    types = _event_types(h)
+    assert types.count("interrupt") == 1
+    assert types.count("response.done") == 1
+
+
+def test_processing_stop_is_safe_from_signal_handler(monkeypatch):
+    """on_orb_stop() routes the pre-TTS stop without raising or playing."""
+    gate = threading.Event()
+    client = TurnClient(answer="Signal handler stop.", gate=gate)
+    h, procs = _turn_helper(monkeypatch, client)
+    t = _run_turn(h, "handler path")
+    assert client.entered.wait(timeout=3.0)
+    h.on_orb_stop()
+    gate.set()
+    t.join(timeout=3.0)
+    assert procs == []
+    assert "interrupt" in _event_types(h)
+
+
+class _BlockedWaitProc(StopProc):
+    """A player whose ``wait`` was already blocked when the stop terminated it.
+
+    ``stop_speaking`` calls ``terminate`` from the signal handler, so the
+    helper's 50 ms ``proc.wait`` returns NORMALLY (not TimeoutExpired). The
+    stop flag must still classify that end as the stop; otherwise the
+    canonical ``interrupt`` boundary is dropped on this race.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.released = threading.Event()
+
+    def terminate(self):
+        super().terminate()
+        self.released.set()
+
+    def wait(self, timeout=None):
+        self.released.wait(timeout=timeout or 0.05)
+        return 0
+
+    def poll(self):
+        return None if self.alive else 0
+
+
+def test_stop_interrupt_survives_a_blocked_wait_returning_normally(monkeypatch):
+    h = _helper(monkeypatch, _cfg(barge_in=False), FakeMic(), [],
+                proc_cls=_BlockedWaitProc)
+    t = _speak_in_thread(h, "long reply that a blocked wait was reading")
+    assert h.stop_speaking() is True
+    t.join(timeout=3.0)
+    assert not t.is_alive()
+    types = _event_types(h)
+    assert "interrupt" in types, (
+        "a stop that terminates a blocked player wait must still emit "
+        f"interrupt; got {types}")
+    assert types.index("interrupt") < types.index("playback.stopped")
+
+
+# ---------------------------------------------------------------------------
+# on-demand canned speak (live harness): gated file + real-time signal
+# ---------------------------------------------------------------------------
+def _write_speak_request(path, text, *, ts=None):
+    import json as _json
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_json.dumps({"text": text,
+                                 "ts": time.time() if ts is None else ts}),
+                    encoding="utf-8")
+
+
+def test_helper_speak_protocol_constants_match_across_modules():
+    from voicebridge.orb import client as oc
+    assert dh.HELPER_SPEAK_SIGNAL == oc.HELPER_SPEAK_SIGNAL
+    assert dh.HELPER_SPEAK_ENV == oc.HELPER_SPEAK_ENV
+    assert dh.HELPER_SPEAK_REQUEST_NAME == oc.HELPER_SPEAK_REQUEST_NAME
+    assert dh.HELPER_SPEAK_MAX_CHARS == oc.HELPER_SPEAK_MAX_CHARS
+    # Distinct from the capture/stop signals.
+    assert dh.HELPER_SPEAK_SIGNAL not in (signal.SIGUSR1, signal.SIGUSR2)
+
+
+def test_helper_speak_gate_is_opt_in(monkeypatch):
+    assert dh.helper_speak_enabled({}) is False
+    assert dh.helper_speak_enabled({dh.HELPER_SPEAK_ENV: "0"}) is False
+    for value in ("1", "true", "YES", "on"):
+        assert dh.helper_speak_enabled({dh.HELPER_SPEAK_ENV: value}) is True
+
+
+def test_read_helper_speak_request_is_bounded_and_fresh(tmp_path):
+    path = tmp_path / "req.json"
+    _write_speak_request(path, "hello")
+    assert dh.read_helper_speak_request(path) == "hello"
+    # Stale request.
+    _write_speak_request(path, "old", ts=time.time() - 3600)
+    assert dh.read_helper_speak_request(path) is None
+    # Oversize text.
+    _write_speak_request(path, "x" * (dh.HELPER_SPEAK_MAX_CHARS + 1))
+    assert dh.read_helper_speak_request(path) is None
+    # Oversize file.
+    path.write_text("{" + "x" * (dh.HELPER_SPEAK_MAX_BYTES + 5) + "}",
+                    encoding="utf-8")
+    assert dh.read_helper_speak_request(path) is None
+    # Junk / empty / NUL.
+    path.write_text("not json", encoding="utf-8")
+    assert dh.read_helper_speak_request(path) is None
+    _write_speak_request(path, "")
+    assert dh.read_helper_speak_request(path) is None
+    _write_speak_request(path, "a\x00b")
+    assert dh.read_helper_speak_request(path) is None
+    assert dh.read_helper_speak_request(tmp_path / "missing.json") is None
+
+
+def test_on_orb_helper_speak_refuses_when_gate_disabled(monkeypatch, tmp_path):
+    h = _helper(monkeypatch, _cfg(), FakeMic(), [])
+    path = tmp_path / "req.json"
+    _write_speak_request(path, "do not speak")
+    monkeypatch.setattr(dh, "helper_speak_request_path", lambda: path)
+    monkeypatch.delenv(dh.HELPER_SPEAK_ENV, raising=False)
+    spoken = []
+    monkeypatch.setattr(h, "_speak", spoken.append)
+    assert h.on_orb_helper_speak() is False
+    assert spoken == [] and path.exists(), "disabled gate must not consume"
+    assert path.exists(), "a refused request is left for a real operator"
+
+
+def test_on_orb_helper_speak_accepts_a_fresh_request(monkeypatch, tmp_path):
+    h = _helper(monkeypatch, _cfg(), FakeMic(), [])
+    path = tmp_path / "req.json"
+    _write_speak_request(path, "hello from the harness")
+    monkeypatch.setattr(dh, "helper_speak_request_path", lambda: path)
+    monkeypatch.setenv(dh.HELPER_SPEAK_ENV, "1")
+    spoken = []
+    monkeypatch.setattr(h, "_speak", lambda text: spoken.append(text))
+    before = h._turn_seq
+    assert h.on_orb_helper_speak() is True
+    deadline = time.time() + 2.0
+    while not spoken and time.time() < deadline:
+        time.sleep(0.005)
+    assert spoken == ["hello from the harness"]
+    assert h._turn_seq == before + 1, "a canned speak is a fresh reply turn"
+    assert h._turn_stopped_seq == -1
+    assert not path.exists(), "an accepted request is consumed once"
+
+
+def test_on_orb_helper_speak_refuses_busy_helper(monkeypatch, tmp_path):
+    h = _helper(monkeypatch, _cfg(), FakeMic(), [])
+    path = tmp_path / "req.json"
+    _write_speak_request(path, "hello")
+    monkeypatch.setattr(dh, "helper_speak_request_path", lambda: path)
+    monkeypatch.setenv(dh.HELPER_SPEAK_ENV, "1")
+    spoken = []
+    monkeypatch.setattr(h, "_speak", spoken.append)
+    h.state = h.PROCESSING
+    assert h.on_orb_helper_speak() is False
+    assert spoken == [] and path.exists()
+    h.state = h.IDLE
+    h._speaking = True
+    assert h.on_orb_helper_speak() is False
+    assert spoken == [] and path.exists()
+    h._speaking = False
+
+
+def test_signal_handlers_install_and_restore_the_speak_signal(monkeypatch):
+    h = _helper(monkeypatch, _cfg(), FakeMic(), [])
+    installed = {}
+    monkeypatch.setattr(signal, "signal",
+                        lambda sig, fn: installed.__setitem__(sig, fn))
+    h._install_orb_signal_handlers()
+    assert signal.SIGRTMIN + 3 == dh.HELPER_SPEAK_SIGNAL
+    assert callable(installed[dh.HELPER_SPEAK_SIGNAL])
+
+    restored = {}
+    monkeypatch.setattr(signal, "signal",
+                        lambda sig, fn: restored.__setitem__(sig, fn))
+    sentinel = object()
+    h._orb_prev_sigrt = sentinel
+    h._orb_prev_sigusr1 = object()
+    h._orb_prev_sigusr2 = object()
+    h.shutdown()
+    assert restored.get(dh.HELPER_SPEAK_SIGNAL) is sentinel
+
+
+def test_orb_client_request_helper_speak_writes_restricted_file_and_signals(
+        monkeypatch, tmp_path):
+    sent = {}
+
+    def fake_kill(pid, sig):
+        sent["pid"] = pid
+        sent["sig"] = sig
+
+    req = tmp_path / "state" / dh.HELPER_SPEAK_REQUEST_NAME
+    monkeypatch.setattr(orb_client, "_helper_speak_request_path", lambda: req)
+    monkeypatch.setattr("voicebridge.orb.client._helper_heartbeat",
+                        lambda: {"schema": "qubit-voice-edit-helper/1",
+                                 "pid": 123456})
+    monkeypatch.setattr("voicebridge.orb.client._helper_cmdline",
+                        lambda pid: "python -m voicebridge.desktop_helper")
+    monkeypatch.setattr(os, "kill", fake_kill)
+    cli = orb_client.OrbClient("http://127.0.0.1:8890", "t")
+    out = cli.request_helper_speak("  hello harness  ")
+    assert out["ok"] is True and out["chars"] == len("hello harness")
+    assert sent == {"pid": 123456, "sig": dh.HELPER_SPEAK_SIGNAL}
+    assert req.read_text(encoding="utf-8").find("hello harness") >= 0
+    assert (req.stat().st_mode & 0o777) == 0o600
+    assert dh.read_helper_speak_request(req) == "hello harness"
+
+
+def test_orb_client_request_helper_speak_bounds_text(monkeypatch, tmp_path):
+    req = tmp_path / "req.json"
+    monkeypatch.setattr(orb_client, "_helper_speak_request_path", lambda: req)
+    monkeypatch.setattr("voicebridge.orb.client._helper_heartbeat",
+                        lambda: {"pid": 1})
+    monkeypatch.setattr("voicebridge.orb.client._helper_cmdline",
+                        lambda pid: "python -m voicebridge.desktop_helper")
+    monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+    cli = orb_client.OrbClient("http://127.0.0.1:8890", "t")
+    out = cli.request_helper_speak("y" * (dh.HELPER_SPEAK_MAX_CHARS + 100))
+    assert out["chars"] == dh.HELPER_SPEAK_MAX_CHARS
+
+
+def test_orb_client_request_helper_speak_rejects_empty_and_foreign(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(orb_client, "_helper_speak_request_path",
+                        lambda: tmp_path / "req.json")
+    cli = orb_client.OrbClient("http://127.0.0.1:8890", "t")
+    for value in ("", "   ", "a\x00b"):
+        try:
+            cli.request_helper_speak(value)
+        except orb_client.OrbError as exc:
+            assert exc.code == "ORB_BAD_SPEAK_TEXT"
+        else:
+            raise AssertionError("bad text must be refused")
+
+    monkeypatch.setattr("voicebridge.orb.client._helper_heartbeat",
+                        lambda: {"pid": 99999})
+    monkeypatch.setattr("voicebridge.orb.client._helper_cmdline",
+                        lambda pid: "firefox --browser")
+    sent = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: sent.append(pid))
+    try:
+        cli.request_helper_speak("hello")
+    except orb_client.OrbError as exc:
+        assert exc.code == "ORB_HELPER_NOT_RUNNING"
+    else:
+        raise AssertionError("foreign pid must be refused")
+    assert sent == []
