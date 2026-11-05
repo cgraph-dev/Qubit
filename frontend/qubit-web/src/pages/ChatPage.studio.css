@@ -1,0 +1,1124 @@
+/* ── Qubit Chat · midnight transit ─────────────────────────────────────────
+   A night-metro control room: navy enamel plate, off-white lettering, one
+   signal-red marker, semantic route colours, hairlines that actually read,
+   and strong typographic hierarchy. No gradient washes, no glass.
+
+   Standout rules:
+   - Blocks are WHITE PANELS in kit CSS (bg-background-base, border). They are
+     flattened here with `background: transparent` / `border: 0` so the
+     layout below is the only box model in play (route strips, rails, rules).
+   - Ornament is built at a weight that reads: 2px route strips, a 3px signal
+     spine, 2px brackets, uppercase mono labels at 0.5–0.6rem.
+   - Every colour derives from the active theme with a navy fallback, so the
+     page keeps its night register under any skin without fighting it.
+   ─────────────────────────────────────────────────────────────────────── */
+.qchat {
+  /* Enamel, lettering, gauges.
+     The surface ladder is the SHARED one from styles/qplate.css — the chat
+     panel and the nav rail are the same primitive, so they must not carry two
+     palettes. `--qchat-*` below are aliases plus the panel's semantic route
+     colours; nothing here hardcodes a chrome surface any more. */
+  --qchat-ink: var(--qplate-ink);
+  --qchat-enamel: var(--qplate-sunk);
+  --qchat-slab: var(--qplate-panel);
+  --qchat-raised: var(--qplate-raised);
+  --qchat-muted: var(--qplate-muted);
+  --qchat-faint: var(--qplate-faint);
+  /* Hairlines come from the ladder: a light steel literal vanished on the
+     light theme and read as a grey scratch on navy. */
+  --qchat-line: var(--qplate-rule-soft);
+  --qchat-line-hard: var(--qplate-rule);
+  --qchat-accent: var(--color-primary, #7f8ea3);
+  /* Semantic route colours: red = the live line and every decision point.
+     Mixed with the theme ink so they stay legible on light and dark alike. */
+  --qchat-signal: color-mix(in srgb, #ff4b3e 82%, var(--midground-base));
+  --qchat-violet: color-mix(in srgb, #b89aff 78%, var(--midground-base));
+  --qchat-cyan: color-mix(in srgb, #63c7d8 78%, var(--midground-base));
+  --qchat-amber: color-mix(in srgb, #e6b25a 88%, var(--midground-base));
+  --qchat-ok: color-mix(in srgb, #6fbf8f 84%, var(--midground-base));
+  /* The "you are here" wash: the accent at low alpha OVER the plate, so it
+     lightens a dark theme and darkens a light one instead of stamping a dark
+     maroon band on a pale panel. */
+  --qchat-signal-wash: color-mix(
+    in srgb,
+    var(--qchat-signal) 16%,
+    var(--qplate-panel)
+  );
+  --qchat-wash: color-mix(in srgb, var(--qchat-accent) 12%, transparent);
+  /* Rail width shared by every "you are here" spine. */
+  --qchat-rail: 3px;
+  --qchat-radius: var(--qplate-radius);
+  --qchat-mono: var(--qplate-font-mono);
+  --qchat-display: var(--theme-font-display, var(--theme-font-sans, system-ui, sans-serif));
+  --qchat-sans: var(--qplate-font-sans);
+
+  display: flex;
+  position: relative;
+  isolation: isolate;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: .5rem;
+  color: var(--qchat-ink);
+  font-family: var(--qchat-sans);
+  font-size: var(--theme-base-size, 15px);
+  line-height: var(--theme-line-height, 1.5);
+  letter-spacing: var(--theme-letter-spacing, 0);
+}
+/* Platform stripe across the top of the page: every route colour plus the
+   red marker sitting where the live line begins. Reads as a transit map
+   legend without a legend. */
+.qchat::before {
+  content: "";
+  position: absolute;
+  z-index: 0;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--qchat-signal);
+  width: 34px;
+  opacity: .85;
+  pointer-events: none;
+}
+
+/* ── Workspace: the only two-column decision on the page ──────────────── */
+.qchat__workspace {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 auto;
+  gap: .6rem;
+}
+
+/* ── Conversation slab ────────────────────────────────────────────────── */
+.qchat__conversation {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+  overflow: hidden;
+  /* Kill the kit panel: no fill, no border, no radius. */
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  padding: .55rem clamp(.6rem, 1.4vw, 1.15rem) .7rem;
+}
+/* Platform rules left and right — the slab is a map margin, not a card. */
+.qchat__conversation::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border: 1px solid var(--qchat-line);
+  background: transparent;
+  pointer-events: none;
+}
+.qchat__conversation > * { position: relative; z-index: 1; }
+
+/* ── Top bar: a sign board ────────────────────────────────────────────── */
+.qchat__header.qchat__header {
+  display: flex;
+  min-height: 3.1rem;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: .5rem .9rem;
+  padding: .55rem 0 .6rem;
+  border: 0;
+  border-bottom: 1px solid var(--qchat-line-hard);
+  background: transparent;
+}
+.qchat__header > div:first-child {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .35rem .6rem;
+}
+.qchat__title.qchat__title {
+  display: inline-flex;
+  align-items: center;
+  gap: .5rem;
+  color: var(--qchat-ink);
+  font-family: var(--qchat-display);
+  font-size: 1rem;
+  font-weight: 650;
+  letter-spacing: .16em;
+  text-transform: uppercase;
+  line-height: 1;
+}
+/* The line badge: red square, empty, the "you are on this route" mark. */
+.qchat__title.qchat__title::before {
+  content: "";
+  width: .62rem;
+  height: .62rem;
+  border: 2px solid var(--qchat-signal);
+  box-shadow: inset 0 0 0 2px var(--qchat-enamel);
+  background: var(--qchat-signal);
+  transform: rotate(45deg);
+}
+.qchat [data-testid="chat-model"] {
+  display: inline-flex;
+  max-width: min(52vw, 30rem);
+  overflow: hidden;
+  padding: .24rem .5rem;
+  border: 1px solid var(--qchat-line);
+  border-left: 2px solid var(--qchat-violet);
+  border-radius: 0;
+  background: var(--qchat-slab);
+  color: var(--qchat-muted);
+  font: 500 .64rem/1.2 var(--qchat-mono);
+  letter-spacing: .04em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Follow toggle reads as a departure board switch, not a form checkbox. */
+.qchat__header label:has(> [data-testid="voice-follow-toggle"]) {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+  padding: .22rem .5rem;
+  border: 1px solid var(--qchat-line);
+  color: var(--qchat-faint);
+  font: 600 .6rem/1 var(--qchat-mono);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.qchat__header label:has(> [data-testid="voice-follow-toggle"]:checked) {
+  border-color: color-mix(in srgb, var(--qchat-signal) 55%, var(--qchat-line));
+  color: var(--qchat-ink);
+}
+.qchat__header [data-testid="voice-follow-toggle"] { accent-color: var(--qchat-signal); }
+.qchat [data-testid="voice-live"] {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+  padding: .22rem .5rem;
+  border: 1px solid color-mix(in srgb, var(--qchat-signal) 60%, transparent);
+  border-radius: 0;
+  background: var(--qchat-signal-wash);
+  color: var(--qchat-ink);
+  font: 650 .6rem/1 var(--qchat-mono);
+  letter-spacing: .11em;
+  text-transform: uppercase;
+}
+.qchat [data-testid="voice-live"] > span[aria-hidden] {
+  width: .42rem;
+  height: .42rem;
+  border-radius: 0;
+  background: var(--qchat-signal);
+  animation: qchat-blink 1.15s steps(1, end) infinite;
+}
+/* Controls cluster: a row of square, hairline-bound instrument keys. */
+.qchat__header > div:last-child {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 0;
+  padding: 0;
+  border: 1px solid var(--qchat-line);
+  border-radius: 0;
+  background: transparent;
+}
+.qchat__header > div:last-child > * {
+  width: 2.15rem !important;
+  height: 2.15rem !important;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  border-left: 1px solid var(--qchat-line);
+  border-radius: 0;
+  background: transparent;
+  color: var(--qchat-muted);
+}
+.qchat__header > div:last-child > *:first-child { border-left: 0; }
+.qchat__header > div:last-child > *:hover {
+  background: color-mix(in srgb, var(--qchat-ink) 6%, transparent);
+  color: var(--qchat-ink);
+}
+.qchat__header > div:last-child > [aria-expanded="true"] {
+  background: var(--qchat-signal-wash);
+  color: var(--qchat-signal);
+  box-shadow: inset 0 -2px var(--qchat-signal);
+}
+
+/* ── Run HUD: the departure board ─────────────────────────────────────── */
+.qchat__run-hud {
+  display: grid;
+  min-height: 3.1rem;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  align-items: stretch;
+  gap: 0;
+  margin-top: .5rem;
+  padding: 0;
+  border: 1px solid var(--qchat-line);
+  border-radius: 0;
+  background: var(--qchat-slab);
+  font-family: var(--qchat-mono);
+}
+.qchat__rank-mark {
+  display: grid;
+  width: 3.3rem;
+  align-content: center;
+  justify-items: center;
+  gap: .1rem;
+  border: 0;
+  border-radius: 0;
+  border-right: 1px solid var(--qchat-line);
+  background: var(--qchat-signal-wash);
+  box-shadow: none;
+  line-height: 1;
+  animation: none;
+}
+.qchat__rank-mark span,
+.qchat__run-stat span {
+  color: var(--qchat-faint);
+  font-size: .5rem;
+  font-weight: 650;
+  letter-spacing: .16em;
+  line-height: 1.2;
+  text-transform: uppercase;
+}
+.qchat__rank-mark strong {
+  color: var(--qchat-signal);
+  font-size: 1.05rem;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  letter-spacing: .02em;
+  line-height: 1;
+}
+.qchat__rank-track {
+  display: grid;
+  min-width: 0;
+  align-content: center;
+  gap: .34rem;
+  padding: .4rem .7rem;
+}
+.qchat__rank-copy {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: .6rem;
+}
+.qchat__rank-copy > span {
+  color: var(--qchat-faint);
+  font-size: .52rem;
+  font-weight: 650;
+  letter-spacing: .16em;
+  text-transform: uppercase;
+}
+.qchat__rank-copy strong {
+  overflow: hidden;
+  color: var(--qchat-muted);
+  font-size: .6rem;
+  font-weight: 500;
+  letter-spacing: .04em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.qchat__rank-charge { color: var(--qchat-ink); font-weight: 700; font-variant-numeric: tabular-nums; }
+/* Station ticks: an empty track with five stops instead of a filled meter. */
+.qchat__rank-meter {
+  display: block;
+  height: .5rem;
+  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  background: repeating-linear-gradient(90deg, var(--qchat-line-hard) 0 1px, transparent 1px 20%);
+}
+.qchat__rank-meter > span {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: 0;
+  background: var(--qchat-signal);
+  transform-origin: left center;
+  transform: scaleX(0);
+  transition: transform 240ms cubic-bezier(.2, .8, .2, 1);
+}
+.qchat__run-stat {
+  display: grid;
+  min-width: 4.1rem;
+  align-content: center;
+  gap: .18rem;
+  padding: .3rem .7rem;
+  border-left: 1px solid var(--qchat-line);
+}
+.qchat__run-stat strong {
+  color: var(--qchat-ink);
+  font-size: .74rem;
+  font-weight: 650;
+  letter-spacing: .06em;
+  line-height: 1.15;
+  font-variant-numeric: tabular-nums;
+}
+.qchat__run-stat--voice strong[data-state="online"] { color: var(--qchat-ok); }
+.qchat__run-stat--voice strong[data-state="offline"] { color: var(--qchat-faint); }
+
+/* ── Voice status: instrument readout strip ───────────────────────────── */
+.qchat__voice-status.qchat__voice-status {
+  display: flex;
+  max-height: 4.2rem;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: .28rem;
+  overflow: auto;
+  margin-top: .4rem;
+  padding: .28rem 0;
+  border: 0;
+  border-bottom: 1px solid var(--qchat-line);
+  border-radius: 0;
+  background: transparent;
+  color: var(--qchat-faint);
+  font: 500 .6rem/1.3 var(--qchat-mono);
+  scrollbar-width: thin;
+}
+.qchat__voice-status > span {
+  display: inline-flex;
+  min-height: 1.4rem;
+  align-items: center;
+  gap: .22rem;
+  padding: .15rem .42rem;
+  border: 1px solid var(--qchat-line);
+  border-left-width: 2px;
+  border-radius: 0;
+  background: transparent;
+  color: var(--qchat-muted);
+  letter-spacing: .03em;
+}
+.qchat__voice-status > span:nth-child(3n + 1) { border-left-color: var(--qchat-cyan); }
+.qchat__voice-status > span:nth-child(3n + 2) { border-left-color: var(--qchat-violet); }
+.qchat__voice-status > span:nth-child(3n) { border-left-color: var(--qchat-amber); }
+.qchat__voice-status > span .font-mono { color: var(--qchat-ink); }
+.qchat__voice-status[data-state="listening"] > span[data-testid="listener-state"] {
+  border-color: color-mix(in srgb, var(--qchat-signal) 55%, var(--qchat-line));
+  background: var(--qchat-signal-wash);
+  color: var(--qchat-ink);
+}
+.qchat__voice-status [data-testid="voice-fallback"] {
+  border-left-color: var(--qchat-amber);
+  color: var(--qchat-amber);
+}
+
+/* ── Transcript ───────────────────────────────────────────────────────── */
+.qchat__transcript.qchat__transcript {
+  position: relative;
+  display: flex;
+  min-height: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: .9rem clamp(.1rem, 1.2vw, .6rem) 1rem;
+  scrollbar-color: var(--qchat-line-hard) transparent;
+  scrollbar-width: thin;
+}
+
+/* Empty state: a station sign, not a hero card. */
+.qchat__transcript [data-state="empty"] {
+  display: grid !important;
+  width: min(100%, 66rem);
+  min-height: 100%;
+  grid-template-columns: minmax(16rem, .82fr) minmax(22rem, 1.18fr);
+  grid-template-rows: auto auto auto;
+  align-content: center;
+  align-items: start;
+  column-gap: clamp(2rem, 5vw, 5rem);
+  row-gap: .9rem;
+  margin: auto;
+  padding: 1rem 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  text-align: left;
+  color: var(--qchat-muted);
+}
+.qchat__transcript [data-state="empty"] p:first-child {
+  grid-column: 1;
+  grid-row: 1;
+  max-width: 12ch;
+  margin: 0;
+  color: var(--qchat-ink);
+  font-family: var(--qchat-display);
+  font-size: clamp(2rem, 3vw, 2.9rem);
+  font-weight: 700;
+  letter-spacing: -.02em;
+  line-height: 1.02;
+  text-transform: uppercase;
+  text-wrap: balance;
+}
+/* Hairline rule under the headline, rebuilt in text: a plain thick rule
+   would read as decoration; this reads as a platform edge. */
+.qchat__transcript [data-state="empty"] p:first-child::after {
+  content: "";
+  display: block;
+  width: 3.2rem;
+  height: 2px;
+  margin-top: .85rem;
+  background: var(--qchat-signal);
+}
+.qchat__transcript [data-state="empty"] p:last-child {
+  grid-column: 1;
+  grid-row: 2;
+  max-width: 40ch;
+  margin: 0;
+  color: var(--qchat-muted);
+  font: 450 .86rem/1.65 var(--qchat-sans);
+}
+
+/* Deco→substance: the ψ probe becomes a three-line transit diagram — three
+   parallel lines, a transfer node where the red line crosses, and a line
+   key naming each route. */
+.qchat__qubit-probe {
+  position: relative;
+  display: grid;
+  width: min(100%, 24rem);
+  grid-column: 1;
+  grid-row: 3;
+  grid-template-columns: auto minmax(0, 1fr) auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto auto;
+  align-items: center;
+  gap: .3rem .5rem;
+  padding: .55rem .1rem .3rem;
+  color: var(--qchat-faint);
+  font: 600 .66rem/1 var(--qchat-mono);
+  letter-spacing: .1em;
+}
+/* Three routes drawn behind the glyphs: violet, cyan, amber. */
+.qchat__qubit-probe::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(.55rem + .5rem);
+  bottom: calc(.3rem + .95rem);
+  background: repeating-linear-gradient(to bottom, var(--qchat-violet) 0 2px, transparent 2px calc(50% - 1px), var(--qchat-cyan) calc(50% - 1px) calc(50% + 1px), transparent calc(50% + 1px) calc(100% - 2px), var(--qchat-amber) calc(100% - 2px) 100%);
+  opacity: .55;
+  pointer-events: none;
+}
+.qchat__qubit-ket {
+  position: relative;
+  justify-self: center;
+  padding: .1rem .3rem;
+  background: var(--qchat-enamel);
+  color: var(--qchat-ink);
+  font-size: .68rem;
+  letter-spacing: .12em;
+}
+.qchat__qubit-wire {
+  position: relative;
+  height: 0;
+  background: transparent;
+}
+.qchat__qubit-wire i { display: none; }
+/* Transfer node: the only white-ringed stop on the diagram. */
+.qchat__qubit-symbol {
+  position: relative;
+  display: grid;
+  width: 1.5rem;
+  height: 1.5rem;
+  place-items: center;
+  border: 2px solid var(--qchat-enamel);
+  border-radius: 0;
+  outline: 1px solid var(--qchat-signal);
+  outline-offset: 0;
+  background: var(--qchat-signal);
+  box-shadow: none;
+  color: var(--qchat-enamel);
+  font: 700 .92rem/1 var(--qchat-display);
+  transform: rotate(45deg);
+}
+.qchat__qubit-equation {
+  display: flex;
+  grid-column: 1 / -1;
+  flex-wrap: wrap;
+  gap: .1rem .75rem;
+  margin-top: .15rem;
+  padding-top: .4rem;
+  border-top: 1px solid var(--qchat-line);
+  color: var(--qchat-faint);
+  font-size: .58rem;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+.qchat__qubit-equation::before {
+  content: "";
+  width: .5rem;
+  height: 2px;
+  align-self: center;
+  background: var(--qchat-violet);
+}
+.qchat__qubit-equation::after {
+  content: "violet · cyan · amber routes";
+  color: var(--qchat-faint);
+}
+
+/* Mission picker: route cards, each led by its line colour. */
+.qchat__mission-picker {
+  grid-column: 2;
+  grid-row: 1 / span 3;
+  align-self: center;
+  width: 100%;
+  margin: 0;
+}
+.qchat__mission-caption {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  margin: 0 0 .6rem;
+  color: var(--qchat-faint);
+  font: 650 .6rem/1 var(--qchat-mono);
+  letter-spacing: .18em;
+  text-transform: uppercase;
+}
+.qchat__mission-caption::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--qchat-line);
+}
+.qchat__mission-list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+  border-top: 1px solid var(--qchat-line);
+}
+.qchat__mission-list button,
+.qchat__mission-list button:nth-child(2),
+.qchat__mission-list button:nth-child(3) {
+  display: grid;
+  min-width: 0;
+  min-height: 4.1rem;
+  grid-template-columns: 2rem minmax(0, 1fr) auto;
+  grid-template-rows: auto auto;
+  align-items: center;
+  column-gap: .8rem;
+  row-gap: .12rem;
+  padding: .62rem .7rem .62rem .85rem;
+  border: 0;
+  border-bottom: 1px solid var(--qchat-line);
+  border-radius: 0;
+  background: transparent;
+  box-shadow: inset var(--qchat-rail) 0 color-mix(in srgb, var(--qchat-tone) 42%, transparent);
+  color: var(--qchat-ink);
+  text-align: left;
+  transition: background-color 140ms ease, box-shadow 140ms ease, padding-left 140ms ease;
+}
+.qchat__mission-list button:hover,
+.qchat__mission-list button:focus-visible {
+  padding-left: 1rem;
+  background: color-mix(in srgb, var(--qchat-tone) 7%, transparent);
+  box-shadow: inset calc(var(--qchat-rail) * 2) 0 var(--qchat-tone);
+  transform: none;
+}
+.qchat__mission-card--violet { --qchat-tone: var(--qchat-violet); }
+.qchat__mission-card--cyan { --qchat-tone: var(--qchat-cyan); }
+.qchat__mission-card--amber { --qchat-tone: var(--qchat-amber); }
+.qchat__mission-icon {
+  display: block;
+  width: 1rem;
+  height: 1rem;
+  grid-column: 1;
+  grid-row: 1 / span 2;
+  justify-self: center;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--qchat-tone);
+  stroke-width: 1.7;
+}
+.qchat__mission-list button > span:nth-child(2) {
+  grid-column: 2;
+  grid-row: 1;
+  overflow: hidden;
+  color: var(--qchat-ink);
+  font: 650 .72rem/1.2 var(--qchat-mono);
+  letter-spacing: .13em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.qchat__mission-detail {
+  grid-column: 2;
+  grid-row: 2;
+  overflow: hidden;
+  color: var(--qchat-muted);
+  font: 450 .76rem/1.3 var(--qchat-sans);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.qchat__mission-arrow {
+  width: .9rem;
+  height: .9rem;
+  grid-column: 3;
+  grid-row: 1 / span 2;
+  color: var(--qchat-tone);
+  opacity: .7;
+  transition: transform 140ms ease, opacity 140ms ease;
+}
+.qchat__mission-list button:hover .qchat__mission-arrow { transform: translateX(3px); opacity: 1; }
+
+/* ── Messages: a line diagram down the left margin ────────────────────── */
+.qchat__messages {
+  display: flex;
+  width: min(100%, 52rem);
+  flex-direction: column;
+  gap: 0;
+  margin-inline: auto;
+}
+/* NOTE: do NOT add `contain: layout paint` here. It defeats the "remember the
+   real rendered size" half of `contain-intrinsic-size: auto <len>`, so rows that
+   scroll out of view get re-sized to the fixed placeholder on the way back in
+   and paint on top of each other (reproduced on very large sessions). */
+.qchat__message.qchat__message {
+  position: relative;
+  width: 100%;
+  max-width: none;
+  margin: 0 !important;
+  padding: .8rem .9rem 1rem 1.15rem;
+  border: 0 !important;
+  border-radius: 0;
+  background: transparent !important;
+  color: var(--qchat-ink);
+  font: 450 .85rem/1.65 var(--qchat-mono);
+  overflow-wrap: anywhere;
+  content-visibility: auto;
+  contain-intrinsic-size: auto 5rem;
+  animation: qchat-message-in 160ms ease-out both;
+}
+/* The rail: every row sits on one continuous vertical line. */
+.qchat__messages > .qchat__message::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 1px;
+  background: var(--qchat-line);
+}
+/* The stop: a small square marking where this row meets the line. */
+.qchat__messages > .qchat__message::after {
+  content: "";
+  position: absolute;
+  top: 1.05rem;
+  left: -3px;
+  width: 7px;
+  height: 7px;
+  border: 1px solid var(--qchat-enamel);
+  background: var(--qchat-faint);
+}
+.qchat__message--assistant::after { background: var(--qchat-violet) !important; }
+.qchat__message--user::after { background: var(--qchat-signal) !important; }
+.qchat__message--tool { color: var(--qchat-muted); font-size: .78rem; }
+.qchat__message--tool::after { background: var(--qchat-amber) !important; }
+.qchat__message--tool > div:first-child { color: var(--qchat-amber) !important; }
+/* Assistant rows carry no tint (the rail does the work); the user's turn is
+   the one filled plate — that is where the reader's eye belongs. */
+.qchat__message--user.qchat__message--user {
+  background: color-mix(in srgb, var(--qchat-signal) 7%, transparent) !important;
+  box-shadow: inset var(--qchat-rail) 0 color-mix(in srgb, var(--qchat-signal) 70%, transparent);
+}
+.qchat__message--tool.qchat__message--tool {
+  background: transparent !important;
+  box-shadow: inset var(--qchat-rail) 0 color-mix(in srgb, var(--qchat-amber) 55%, transparent);
+}
+.qchat__message--progress.qchat__message--progress,
+.qchat__message--streaming.qchat__message--streaming {
+  background: transparent !important;
+  box-shadow: inset var(--qchat-rail) 0 var(--qchat-cyan);
+}
+.qchat__message--progress::after,
+.qchat__message--streaming::after { background: var(--qchat-cyan) !important; }
+/* Speaker label: the loudest small text on the page. */
+.qchat__message > div:first-of-type > span:first-child {
+  color: var(--qchat-faint);
+  font: 650 .58rem/1 var(--qchat-mono);
+  letter-spacing: .18em;
+  text-transform: uppercase;
+}
+.qchat__message--user > div:first-of-type > span:first-child { color: var(--qchat-signal); }
+.qchat__message--streaming > div:first-of-type { color: var(--qchat-cyan); font: 650 .58rem/1 var(--qchat-mono); letter-spacing: .18em; text-transform: uppercase; }
+.qchat__message > div.whitespace-pre-wrap,
+.qchat__message [data-testid="message-report-full"] > div { color: var(--qchat-ink); }
+.qchat__message a { color: var(--qchat-cyan); text-underline-offset: 2px; }
+.qchat__message a:hover { color: var(--qchat-ink); }
+.qchat__message [data-testid="message-task-key"],
+.qchat__message [data-testid="message-sources"],
+.qchat__message [data-testid="message-report-full"] > summary,
+.qchat__message > div.mt-1.text-xs { color: var(--qchat-faint); }
+.qchat__message details > summary:hover { color: var(--qchat-ink) !important; }
+@keyframes qchat-message-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+
+/* Thinking rows */
+.qchat__activity.qchat__activity {
+  display: inline-flex;
+  width: fit-content;
+  min-height: 2.1rem;
+  align-items: center;
+  gap: .55rem;
+  margin-left: 0;
+  padding: .4rem .7rem;
+  border: 1px solid var(--qchat-line);
+  border-left: 2px solid var(--qchat-cyan);
+  border-radius: 0;
+  background: transparent;
+  color: var(--qchat-muted);
+  font: 550 .7rem/1 var(--qchat-mono);
+  letter-spacing: .05em;
+}
+@keyframes qchat-blink { 50% { opacity: .25; } }
+
+/* ── Composer: the ticket reader ──────────────────────────────────────── */
+.qchat__composer.qchat__composer {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: .4rem;
+  margin-top: .55rem;
+  padding: .55rem .55rem .55rem .85rem;
+  border: 1px solid var(--qchat-line-hard) !important;
+  border-left: var(--qchat-rail) solid var(--qchat-signal) !important;
+  border-radius: 0;
+  background: var(--qchat-raised);
+  box-shadow: none;
+  transition: border-color 150ms ease, background-color 150ms ease;
+}
+.qchat__composer.qchat__composer:focus-within {
+  border-color: color-mix(in srgb, var(--qchat-signal) 45%, var(--qchat-line-hard)) !important;
+  border-left-color: var(--qchat-signal) !important;
+  background: color-mix(in srgb, var(--qchat-signal) 4%, var(--qchat-raised));
+  box-shadow: none;
+}
+/* Order: engine/reasoning pickers first, interim + work panel, then the
+   field, then actions. */
+.qchat__composer > label:has(select[aria-label="Voice engine"]) { order: 0; }
+.qchat__composer > label:has(select[aria-label="Reasoning effort"]) { order: 1; }
+.qchat__composer [data-testid="voice-interim"] { order: 2; }
+.qchat__composer > .relative { order: 3; flex: 1 0 100%; min-width: 0; }
+.qchat__composer textarea {
+  display: block;
+  width: 100%;
+  min-height: 3.3rem;
+  padding: .65rem .15rem;
+  border: 0 !important;
+  border-radius: 0;
+  background: transparent !important;
+  color: var(--qchat-ink);
+  /* 16px floor: smaller faces make iOS zoom the whole page on focus. */
+  font: 450 1rem/1.55 var(--qchat-sans);
+  box-shadow: none !important;
+  resize: none;
+}
+.qchat__composer textarea::placeholder { color: var(--qchat-faint); }
+.qchat__composer textarea:focus { box-shadow: none !important; }
+.qchat__composer > input[type="file"] { display: none; }
+/* Controlled selects get a hairline frame and a mono label register. */
+.qchat__composer select {
+  min-height: 1.95rem;
+  max-width: 13rem;
+  padding: .25rem 1.4rem .25rem .45rem;
+  border: 1px solid var(--qchat-line);
+  border-radius: 0;
+  background-color: transparent;
+  color: var(--qchat-muted);
+  font: 550 .64rem/1.2 var(--qchat-mono);
+  letter-spacing: .06em;
+  appearance: none;
+  background-image: none;
+}
+.qchat__composer select:hover { border-color: var(--qchat-line-hard); color: var(--qchat-ink); }
+/* Action buttons: flat, square, mono, hairline. */
+.qchat__composer > button {
+  order: 4;
+  width: max-content !important;
+  min-height: 2rem;
+  flex: 0 0 auto !important;
+  align-self: flex-end;
+  gap: .35rem;
+  padding: .35rem .7rem;
+  border: 1px solid var(--qchat-line);
+  border-radius: 0;
+  background: transparent;
+  color: var(--qchat-muted);
+  font: 600 .64rem/1 var(--qchat-mono);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+.qchat__composer > button > svg { width: .9rem; height: .9rem; }
+.qchat__composer > button:hover:not(:disabled) {
+  border-color: var(--qchat-line-hard);
+  background: color-mix(in srgb, var(--qchat-ink) 6%, transparent);
+  color: var(--qchat-ink);
+}
+/* Send is the one filled control on the page. */
+.qchat__composer > button[type="submit"] {
+  order: 5;
+  min-width: 6.2rem;
+  border-color: var(--qchat-signal);
+  background: var(--qchat-signal);
+  color: var(--qchat-enamel);
+  font-weight: 700;
+}
+.qchat__composer > button[type="submit"]:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--qchat-signal) 80%, #fff);
+  background: color-mix(in srgb, var(--qchat-signal) 88%, #fff);
+  color: var(--qchat-enamel);
+  box-shadow: none;
+}
+.qchat__composer > button[type="submit"]:disabled {
+  border-color: var(--qchat-line);
+  background: transparent;
+  color: var(--qchat-faint);
+  opacity: 1;
+}
+.qchat__composer button[aria-label="Stop voice input"] {
+  border-color: var(--qchat-signal);
+  background: var(--qchat-signal-wash);
+  color: var(--qchat-signal);
+}
+.qchat__composer button:disabled { cursor: not-allowed; }
+
+/* ── Session actions: a footer rule with mono commands ────────────────── */
+.qchat__session-actions.qchat__session-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: flex-start;
+  gap: .15rem;
+  margin-top: .5rem;
+  padding: .3rem 0 0;
+  border: 0;
+  border-top: 1px solid var(--qchat-line);
+  border-radius: 0;
+  background: transparent;
+}
+.qchat__session-actions > button,
+.qchat__session-actions > a {
+  display: inline-flex;
+  min-height: 1.9rem;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: .35rem;
+  padding: .32rem .6rem;
+  border: 1px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  color: var(--qchat-muted);
+  font: 550 .63rem/1 var(--qchat-mono);
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.qchat__session-actions > button:hover:not(:disabled),
+.qchat__session-actions > a:hover {
+  border-color: var(--qchat-line);
+  background: color-mix(in srgb, var(--qchat-ink) 5%, transparent);
+  color: var(--qchat-ink);
+}
+.qchat__session-actions > a:last-child { color: var(--qchat-cyan); }
+.qchat__session-actions > button:disabled { opacity: .45; }
+
+/* The side panel's own styling moved to styles/qplate.css so /chat — which
+   does not load this page stylesheet — gets the same plate. Only the page's
+   own surface rules stay here. */
+
+/* Reports + session list */
+.qchat__reports {
+  display: flex;
+  flex: 0 0 auto;
+  min-width: 0;
+  flex-direction: column;
+  gap: .1rem;
+  padding: .15rem .3rem .35rem;
+  border-bottom: 1px solid var(--qchat-line);
+  background: transparent;
+}
+.qchat__reports > div:first-child {
+  color: var(--qchat-faint);
+  font: 650 .56rem/1 var(--qchat-mono);
+  letter-spacing: .2em;
+  text-transform: uppercase;
+}
+.qchat__reports > div:first-child > span:nth-child(2) { color: var(--qchat-muted); }
+.qchat__reports p { color: var(--qchat-faint); }
+.qchat__reports button {
+  padding: .3rem .2rem !important;
+  border-left: 2px solid transparent;
+  border-radius: 0 !important;
+  color: var(--qchat-muted) !important;
+  font: 450 .72rem/1.3 var(--qchat-sans);
+}
+.qchat__reports button:hover {
+  border-left-color: var(--qchat-cyan);
+  background: transparent !important;
+  color: var(--qchat-ink) !important;
+}
+.qchat__sessions.qchat__sessions {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  padding: 0 !important;
+  border: 0;
+  background: transparent;
+  display: flex;
+  flex-direction: column;
+}
+.qchat__sessions > div { min-height: 0; flex: 1 1 auto; overflow-y: auto; padding: 0 0 0 .1rem; scrollbar-color: var(--qchat-line-hard) transparent; scrollbar-width: thin; }
+.qchat__sessions button { min-height: 2.1rem; border-radius: 0 !important; }
+/* Active session: red spine, no glow, no pulse. */
+.qchat__sessions [aria-current="true"],
+.qchat__session-row--active.qchat__session-row--active {
+  position: relative;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: var(--qchat-signal-wash) !important;
+  box-shadow: inset var(--qchat-rail) 0 var(--qchat-signal) !important;
+  animation: none !important;
+  font-weight: 600;
+}
+.qchat__session-row--active.qchat__session-row--active::before,
+.qchat__session-row--active.qchat__session-row--active::after {
+  content: none !important;
+  display: none !important;
+  animation: none !important;
+}
+
+/* ── Loading marks: the Qubit atom (transcript + model panels) ────────── */
+.qchat__transcript-loading { display: flex; min-height: 100%; align-items: center; justify-content: center; padding: 1rem; }
+.qchat__sessions-skeleton { display: grid; gap: .3rem; padding: .3rem 0; }
+.qchat__session-skeleton-row {
+  display: grid;
+  gap: .38rem;
+  padding: .5rem .5rem .5rem .6rem;
+  border: 0;
+  border-left: 1px solid var(--qchat-line);
+  border-radius: 0;
+  background: transparent;
+}
+.qchat__session-skeleton-row > span {
+  display: block;
+  height: .42rem;
+  border-radius: 0;
+  background: repeating-linear-gradient(90deg, color-mix(in srgb, var(--qchat-ink) 8%, transparent) 0 4px, transparent 4px 8px);
+}
+.qchat__session-skeleton-row > span:first-child { width: 72%; }
+.qchat__session-skeleton-row > span:last-child { width: 42%; height: .3rem; }
+.qchat__model-skeleton {
+  display: flex;
+  min-height: 3rem;
+  align-items: center;
+  justify-content: center;
+  padding: .5rem 0;
+  border: 0;
+  border-bottom: 1px solid var(--qchat-line);
+  border-radius: 0;
+  background: transparent;
+}
+
+/* ── Focus: red ring everywhere, consistent with the signal marker ────── */
+.qchat button, .qchat a {
+  transition: color 130ms ease, border-color 130ms ease, background-color 130ms ease;
+}
+.qchat button:focus-visible,
+.qchat a:focus-visible,
+.qchat select:focus-visible,
+.qchat textarea:focus-visible,
+.qchat summary:focus-visible {
+  outline: 2px solid var(--qchat-signal);
+  outline-offset: 2px;
+}
+
+/* ── Layout ───────────────────────────────────────────────────────────── */
+@media (min-width: 1024px) {
+  .qchat__workspace { display: grid; grid-template-columns: minmax(0, 1fr) 19rem; }
+  .qchat__workspace:not(:has(> .qchat__side)) { grid-template-columns: minmax(0, 1fr); }
+  .qchat__side { height: 100%; }
+}
+@media (max-width: 1023px) {
+  .qchat__workspace { flex-direction: column; overflow-y: auto; }
+  .qchat__conversation {
+    height: min(86dvh, 52rem);
+    min-height: min(86dvh, 52rem);
+    flex: 0 0 auto;
+  }
+  .qchat__side {
+    display: grid;
+    width: 100% !important;
+    max-height: none;
+    grid-template-columns: minmax(0, 1fr);
+    overflow: visible;
+    border-left: 0;
+    border-top: 1px solid var(--qchat-line-hard);
+  }
+  .qchat__model-panel, .qchat__artifacts, .qchat__sessions { min-width: 0; flex: initial; }
+  .qchat__sessions > div { overflow: visible; }
+  .qchat__session-actions { flex-wrap: wrap; gap: 0; }
+}
+@media (max-width: 1279px) {
+  .qchat__transcript [data-state="empty"] {
+    width: min(100%, 40rem);
+    height: max-content !important;
+    min-height: 0 !important;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto auto auto auto;
+    align-content: start !important;
+    gap: .7rem;
+    margin: 0 auto;
+    padding: 1rem 0;
+  }
+  .qchat__transcript [data-state="empty"] p:first-child,
+  .qchat__transcript [data-state="empty"] p:last-child,
+  .qchat__qubit-probe,
+  .qchat__mission-picker { grid-column: 1; }
+  .qchat__transcript [data-state="empty"] p:first-child { grid-row: 1; max-width: 16ch; font-size: clamp(1.7rem, 4.4vw, 2.4rem); }
+  .qchat__transcript [data-state="empty"] p:last-child { grid-row: 2; max-width: 52ch; }
+  .qchat__qubit-probe { grid-row: 3; }
+  .qchat__mission-picker { grid-row: 4; }
+}
+@media (max-width: 640px) {
+  .qchat__conversation { padding: .5rem .55rem .6rem; }
+  .qchat__header { min-height: 2.6rem; align-items: flex-start; gap: .4rem; }
+  .qchat__header > div:first-child { flex-wrap: wrap; }
+  .qchat__title.qchat__title { font-size: .88rem; letter-spacing: .13em; }
+  .qchat [data-testid="chat-model"] { max-width: 66vw; }
+  .qchat__header > div:last-child { margin-left: auto; }
+  .qchat__header > div:last-child > * { width: 2rem !important; height: 2rem !important; }
+  .qchat__run-hud { grid-template-columns: auto minmax(0, 1fr) auto; }
+  .qchat__run-stat--voice { display: none; }
+  .qchat__rank-copy { align-items: flex-start; flex-direction: column; gap: .12rem; }
+  .qchat__voice-status { max-height: 3.8rem; }
+  .qchat__transcript { padding: .7rem 0; }
+  .qchat__transcript [data-state="empty"] { grid-template-columns: minmax(0, 1fr); gap: .6rem; padding: .8rem 0; }
+  .qchat__transcript [data-state="empty"] p:first-child { font-size: clamp(1.6rem, 8.5vw, 2.2rem); }
+  .qchat__qubit-probe { width: 100%; }
+  .qchat__mission-list button,
+  .qchat__mission-list button:nth-child(2),
+  .qchat__mission-list button:nth-child(3) { min-height: 3.5rem; }
+  .qchat__message.qchat__message { padding: .65rem .6rem .8rem .9rem; font-size: .82rem; }
+  .qchat__composer { gap: .35rem; padding: .5rem .5rem .5rem .6rem; }
+  .qchat__composer > label { flex: 1 1 auto; min-width: 0; }
+  .qchat__composer select { width: 100%; max-width: none; }
+  .qchat__composer textarea { min-height: 3.1rem; }
+  .qchat__composer > button { flex: 0 0 auto; }
+  .qchat__composer > button[type="submit"] { margin-left: auto; }
+  .qchat__session-actions > button,
+  .qchat__session-actions > a { padding-inline: .45rem; font-size: .58rem; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .qchat *, .qchat *::before, .qchat *::after {
+    animation: none !important;
+    scroll-behavior: auto !important;
+    transition: none !important;
+  }
+  .qchat__session-row--active { box-shadow: inset var(--qchat-rail) 0 var(--qchat-signal) !important; }
+}

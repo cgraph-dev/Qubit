@@ -1,0 +1,620 @@
+/* Animated Qubit wordmark + sidebar brand.
+ *
+ * Visual language: THIN RGB OUTLINE, no glow.
+ *
+ * The "RGB" look here is a chromatic-fringe technique, not a rainbow gradient:
+ * the same hairline ellipse is drawn three times, offset by a fraction of a
+ * pixel in red / green / blue with `mix-blend-mode: screen`. Because the
+ * offsets are sub-pixel, the strokes overlap into near-white at the centre of
+ * the line and split into colour only at the edges — the way an unfocused lens
+ * fringes a thin bright line. That is what reads as technical rather than
+ * childish; a drop-shadow bloom reads as a sticker.
+ *
+ * The chromatic fringe below is a hard 0.45px channel offset, NOT a blur, and it
+ * is the one deliberate exception: at 56px anything softer swallows the hairline.
+ */
+
+/* ---------- Base ---------- */
+
+.qubit-mark {
+  overflow: visible;
+}
+
+/* Each guide ring ROTATES as a flat 2D shape about its own centre, on its own
+ * period. That is a different motion from a 3D sweep (which needs the ellipse
+ * to change shape per frame) — a 2D spin reads as a slowly turning orbit and,
+ * because every plane carries a DIFFERENT squash, the three silhouettes never
+ * collapse onto one line the way identical ellipses did.
+ *
+ * The spin lives on the <ellipse>. The per-plane TILT is carried by the wrapper
+ * <g transform="rotate(...)">, so spinning never fights the tilt. */
+/* Each ring TURNS about the nucleus, as a flat 2D rotation.
+ *
+ * The rings used to wobble ±11°, which never produced a full revolution — the
+ * mark read as frozen. They now rotate a full 360° on their own periods. That is
+ * safe only because the three rings carry clearly different squashes (0.46 /
+ * 0.70 / 0.86) and tilts well apart: a rotating ellipse passes through its own
+ * tilt pose each half-turn, and identical squashes are what made all three do
+ * that simultaneously and stack into one line. Distinct squashes mean no two
+ * ever share a silhouette, so the lattice stays a lattice while it turns.
+ *
+ * The turn lives on the <ellipse>; the per-plane TILT is carried by the wrapper
+ * <g transform="rotate(...)">, so the animation never fights the tilt. */
+.qubit-mark__ring {
+  fill: none;
+  /* Thinned from 1.1: at 56px five 1.1px wires read as the whole logo and the
+   * particles become decoration on them. At 0.8 the rings are still legible as
+   * orbits but the eye follows the beads first, which is what makes the mark
+   * read as a particle system rather than a wireframe. */
+  stroke-width: 0.8;
+  vector-effect: non-scaling-stroke;
+}
+
+/* ---------- The 3D projection ----------
+ *
+ * Each ring is a <circle>; its plane is turned through 3D by scaling y with
+ * cos(theta). Face-on the circle is whole, edge-on it collapses to a line, and
+ * it passes back through face-on mirrored. That IS the projection an orbit makes
+ * when it turns — the ring genuinely opens and closes, which a screen-plane
+ * rotate() can never do.
+ *
+ * The small x-term counter-scales so the ring does not visibly gain width as it
+ * closes: without it the mark pumps in size twice per turn.
+ *
+ * The beads sit inside this same wrapper, so their depth comes from the same
+ * transform and needs no faked scale.
+ */
+.qubit-mark__plane {
+  transform-box: view-box;
+  transform-origin: 20px 20px;
+  animation-name: qubit-mark-plane-turn;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+  will-change: transform;
+}
+
+@keyframes qubit-mark-plane-turn {
+  0% {
+    transform: scale(1, 1);
+  }
+  25% {
+    transform: scale(1.02, 0);
+  }
+  50% {
+    transform: scale(1, -1);
+  }
+  75% {
+    transform: scale(1.02, 0);
+  }
+  100% {
+    transform: scale(1, 1);
+  }
+}
+
+/* The near ring keeps the mark's own colour (currentColor from the caller);
+ * the far ring is dimmer so the fields read as depth. */
+/* Low base opacity: the chromatic copies below are the visible line, so a
+ * solid stroke here would bury them. */
+.qubit-mark__ring--near {
+  stroke: currentColor;
+  stroke-opacity: 0.42;
+}
+
+.qubit-mark__ring--far {
+  stroke: currentColor;
+  stroke-opacity: 0.17;
+}
+
+/* Deepest line stays the faintest — it is a depth cue, not a feature. */
+.qubit-mark__ring--deep {
+  stroke: currentColor;
+  stroke-opacity: 0.18;
+}
+
+/* The two innermost planes. Lower opacity keeps five rings from reading as
+ * clutter: the eye follows the two brightest (near and closest) and resolves the
+ * rest as depth. */
+.qubit-mark__ring--mid {
+  stroke: currentColor;
+  stroke-opacity: 0.24;
+}
+
+.qubit-mark__ring--closest {
+  stroke: currentColor;
+  stroke-opacity: 0.34;
+}
+
+/* RGB fringe.
+ *
+ * The base stroke is the SAME hairline drawn three times, once per channel,
+ * offset in opposite directions. Painting a solid currentColor stroke on top
+ * would bury the fringe (that is why the first attempt showed only a blue
+ * hint) — so the ring's own stroke is kept low-opacity and the three chromatic
+ * copies carry the visible line. Overlap reads near-white; edges split into
+ * red/blue. */
+.qubit-mark__ring--near,
+.qubit-mark__ring--far,
+.qubit-mark__ring--deep,
+.qubit-mark__ring--mid,
+.qubit-mark__ring--closest {
+  filter:
+    drop-shadow(0.45px 0 0 rgb(255 45 85 / 0.75))
+    drop-shadow(-0.45px 0 0 rgb(45 130 255 / 0.75));
+}
+
+/* ---------- Particles ---------- */
+
+/* Beads are plain filled dots: the plane wrapper provides their depth, so no
+ * scale/opacity beat is layered on top of a transform that already moves them. */
+.qubit-mark__bead {
+  fill: currentColor;
+  fill-opacity: 0.92;
+  /* A faint per-particle dim so the beads read at different depths instead of
+   * one flat sheet of identical dots. Beads on the deep/outer planes inherit the
+   * field opacity, which already varies; this adds the rest. */
+  opacity: var(--bead-dim, 1);
+}
+
+/* Free motes — dust drifting through the lattice. A slow vertical drift plus an
+ * opacity breath, on eight non-harmonic periods, so there is always some part of
+ * the mark in motion even at the slowest ring phase. `--mote-drift` carries the
+ * per-mote amplitude so the keyframes stay one shared rule. */
+.qubit-mark__mote {
+  fill: currentColor;
+  /* Dust, not beads: low base alpha so a mote never competes with a real
+   * particle, but high enough to register at 56px. */
+  fill-opacity: 0.62;
+  animation-name: qubit-mark-mote-drift;
+  animation-timing-function: ease-in-out;
+  animation-iteration-count: infinite;
+  animation-direction: alternate;
+  will-change: transform, opacity;
+}
+
+@keyframes qubit-mark-mote-drift {
+  from {
+    transform: translate(
+        calc(var(--mote-drift, 1.5) * -0.7px),
+        calc(var(--mote-drift, 1.5) * -1px)
+      )
+      scale(0.7);
+    opacity: 0.18;
+  }
+  to {
+    transform: translate(
+        calc(var(--mote-drift, 1.5) * 0.7px),
+        calc(var(--mote-drift, 1.5) * 1px)
+      )
+      scale(1.2);
+    opacity: 0.78;
+  }
+}
+
+/* ---------- Nucleus ---------- */
+
+.qubit-mark__nucleus {
+  fill: currentColor;
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: qubit-mark-nucleus 3.6s ease-in-out infinite;
+}
+
+@keyframes qubit-mark-nucleus {
+  0%,
+  100% {
+    opacity: 0.95;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.65;
+    transform: scale(0.85);
+  }
+}
+
+/* ---------- Hover: the lattice opens up ----------
+ *
+ * Transitions, not re-animations, so the change can be interrupted cleanly.
+ * The two fields splay apart and the ring brightens; there is deliberately no
+ * glow added on hover (the mark is an outline, and glowing on contact would
+ * reintroduce exactly the look this replaces).
+ */
+.qubit-mark__field {
+  transform-box: view-box;
+  transform-origin: 20px 20px;
+  transition: transform 520ms cubic-bezier(0.22, 1, 0.36, 1), opacity 520ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.qubit-mark__field--far {
+  opacity: 0.75;
+}
+
+/* Deepest plane sits behind both crossed fields. */
+.qubit-mark__field--mid,
+.qubit-mark__field--deep {
+  opacity: 0.8;
+}
+
+.qubit-mark__ring {
+  transition: stroke-opacity 320ms ease;
+}
+
+.qagent-sidebar__brand-row:hover .qubit-mark__field--near,
+.qagent-sidebar__brand-row:focus-within .qubit-mark__field--near {
+  transform: rotate(7deg) scale(1.03);
+}
+
+.qagent-sidebar__brand-row:hover .qubit-mark__field--far,
+.qagent-sidebar__brand-row:focus-within .qubit-mark__field--far {
+  transform: rotate(-7deg) scale(1.03);
+  opacity: 1;
+}
+
+/* The deep plane opens in the opposite direction, so hovering splays the whole
+ * lattice instead of sliding two rings together. */
+.qagent-sidebar__brand-row:hover .qubit-mark__field--deep,
+.qagent-sidebar__brand-row:focus-within .qubit-mark__field--deep {
+  transform: rotate(4deg) scale(1.02);
+  opacity: 0.9;
+}
+
+.qagent-sidebar__brand-row:hover .qubit-mark__ring--far,
+.qagent-sidebar__brand-row:hover .qubit-mark__ring--mid,
+.qagent-sidebar__brand-row:hover .qubit-mark__ring--deep {
+  stroke-opacity: 0.6;
+}
+
+/* Hover speeds every plane up, so the mark visibly responds to contact without
+ * adding any glow (the mark is an outline; glowing would undo the look). */
+.qagent-sidebar__brand-row:hover .qubit-mark__plane,
+.qagent-sidebar__brand-row:focus-within .qubit-mark__plane {
+  animation-duration: 7.5s !important;
+}
+
+.qagent-sidebar__brand-row:hover .qubit-mark__mote,
+.qagent-sidebar__brand-row:focus-within .qubit-mark__mote {
+  animation-duration: 6.2s !important;
+}
+
+/* ---------- Wordmark ----------
+ *
+ * One treatment, deliberately. An earlier pass painted the label three times
+ * over — a gradient-clipped fill plus two `data-brand` pseudo-element copies
+ * stroked red and blue for a chromatic fringe — and in practice those copies
+ * showed through as doubled, garbled text. On an 18px UI label the fringe
+ * costs legibility and buys nothing: the rail reads as an instrument panel,
+ * so the wordmark does too. Flat theme colour, one slow sheen, no clones.
+ */
+.qagent-sidebar .qagent-sidebar__brand-name {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  font-family: var(--theme-font-display, var(--theme-font-sans, sans-serif));
+  font-size: 1.08rem;
+  font-weight: 700;
+  letter-spacing: -0.015em;
+  line-height: 1;
+  color: var(--qsidebar-ink, var(--midground-base));
+  background-image: linear-gradient(
+    100deg,
+    var(--qsidebar-ink, var(--midground-base)) 0%,
+    var(--midground-base) 38%,
+    color-mix(in srgb, var(--midground-base) 74%, var(--qsidebar-ink, var(--midground-base))) 52%,
+    var(--qsidebar-ink, var(--midground-base)) 100%
+  );
+  background-size: 320% 100%;
+  background-position: 100% 0;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: qubit-brand-sheen 9s ease-in-out infinite, qubit-brand-in 520ms cubic-bezier(0.22, 1, 0.36, 1) 1 both;
+}
+
+/* No fringe copies: the element carries no pseudo-element text at all. */
+.qagent-sidebar .qagent-sidebar__brand-name::before,
+.qagent-sidebar .qagent-sidebar__brand-name::after {
+  content: none;
+}
+
+@keyframes qubit-brand-sheen {
+  0%,
+  58% {
+    background-position: 100% 0;
+  }
+  88%,
+  100% {
+    background-position: -140% 0;
+  }
+}
+
+@keyframes qubit-brand-in {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* The label child carries the clip, because -webkit-text-fill-color is
+ * INHERITED: without re-declaring the gradient here the span would inherit
+ * `transparent` but own no background, and the letters would render hollow.
+ * `overflow: hidden` keeps a long brand string inside the rail instead of
+ * spilling over the status chip. */
+.qagent-sidebar .qagent-sidebar__brand-name .qbrand-label {
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  background-image: inherit;
+  background-size: inherit;
+  background-position: inherit;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: inherit;
+  animation: qubit-brand-sheen 9s ease-in-out infinite;
+}
+
+/* ---------- Orbital spark cloud around the wordmark ----------
+ *
+ * The mark reads as a qubit with particles on tilted ellipses; this continues
+ * that language across the text. Two orbit planes are threaded through the
+ * wordmark — a far plane behind the letters and a near plane in front — so the
+ * cloud genuinely wraps the label instead of sitting in a flat layer.
+ *
+ * The 3D is built from cheap 2D primitives, all on the compositor:
+ *
+ *   .qbrand-sparks__orbit  spins a whole ellipse about the label centre.
+ *   .qbrand-sparks__dot    is placed on that ellipse at its own seed angle
+ *                          (rotate + translateX in its inline base transform)
+ *                          and runs the depth cycle: scale + opacity down as it
+ *                          swings to the far half, up as it comes forward.
+ *   .qbrand-sparks__plane  fixes the stacking level per plane.
+ *
+ * WHY the seed angle matters: a dot pinned at (centre + radius) inside a
+ * rotating group would put every spark on the same coordinate at t=0 and the
+ * group would just spin around the pile. The seed rotation in the base
+ * transform is what distributes them.
+ */
+.qbrand-sparks {
+  position: absolute;
+  /* Generous inset: the orbit radii below are in px, measured from the label
+   * centre, so the field box has to be visibly larger than the text or the
+   * widest far orbit gets clipped by the label. */
+  inset: -160% -140%;
+  overflow: visible;
+  pointer-events: none;
+  /* Establishes the stacking context the planes index into. */
+  z-index: 0;
+}
+
+/* Each plane is a full-size, non-hit-testing layer inside the field. The plane
+ * is also where the STATIC ellipse tilt lives: it must not share the transform
+ * property with the spinning group, or the inline tilt would be overridden by
+ * the orbit animation for its whole duration. Two elements, two jobs. */
+.qbrand-sparks__plane {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+/* Far plane: below the label fill (the label's chromatic pseudo-copies sit at
+ * z-index -1 inside the wordmark's stacking context, the text fill at 1). */
+.qbrand-sparks__plane--far {
+  z-index: -1;
+  /* Tilt only. The per-spark squash lives on each orbit group, because ry/rx
+   * differs per spark and this plane is shared. */
+  transform: rotate(var(--spark-tilt, 0deg));
+}
+
+/* Near plane: in front of the far plane, BELOW the label fill.
+ * Opposite tilt to the far plane — that opposition is what stops the two arcs
+ * reading as one flat ring. See the near-plane rule below for why it no longer
+ * climbs above the glyphs. */
+/* Near sparks keep a touch of glow so they read as closer to the viewer; the
+ * far plane deliberately has none so it recedes instead of crowding the text.
+ *
+ * The near plane does NOT climb above the glyphs. It used to sit at z-index 2
+ * so the cloud appeared to wrap the label, but the wordmark is a clipped
+ * gradient — a particle crossing it reads as dust on the letters, not depth,
+ * and at 18px it measurably hurt legibility. Behind the text, in front of the
+ * far plane: still a cloud, never a smear. */
+.qbrand-sparks__plane--near {
+  z-index: 0;
+  transform: rotate(var(--spark-tilt, 0deg));
+}
+
+/* Orbit group: a zero-size box at the centre of the label. The orbit animation
+ * spins it about that centre. */
+.qbrand-sparks__orbit {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 0;
+  height: 0;
+  transform-origin: 0 0;
+  animation-name: qubit-brand-orbit;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+  will-change: transform;
+}
+
+/* Dot: positioned relative to its zero-size orbit box, then carried out to the
+ * ellipse edge by its inline `rotate(seed) translateX(rx) scaleY(...)`.
+ * `transform-origin: 0 0` makes that offset resolve from the centre.
+ *
+ * IMPORTANT: the depth animation also animates `transform`, and CSS animations
+ * on one property do not stack — a running animation REPLACES the element's
+ * declared transform. That is why the orbital placement cannot live here: it
+ * would be wiped the instant the depth cycle starts and every spark would
+ * collapse toward the centre. The placement therefore sits on the parent
+ * `.qbrand-sparks__orbit` (static, inline) and this element only owns scale. */
+.qbrand-sparks__dot {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+  border-radius: 50%;
+  background: var(--qsidebar-accent, currentColor);
+  opacity: 0;
+  animation-name: qubit-brand-depth;
+  animation-timing-function: ease-in-out;
+  animation-iteration-count: infinite;
+  will-change: transform, opacity;
+}
+
+.qbrand-sparks__place {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+  /* No animation here on purpose: this element owns the spark's fixed orbital
+   * position, so nothing may replace its transform. */
+}
+
+
+.qbrand-sparks__unsquash {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: center;
+  /* Undoes the path squash so the particle stays circular. Centred origin so
+   * the correction pivots on the dot rather than dragging it off its path. */
+  margin-left: -0.5px;
+  margin-top: -0.5px;
+}
+
+.qbrand-sparks__path {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+  /* Squashes the travel path into an ellipse. Kept separate from the place
+   * wrapper so the squash does not also flatten the particle itself. */
+}
+
+/* Near sparks keep a touch of glow so they read as closer to the viewer; the
+ * far plane deliberately has none so it recedes instead of crowding the text. */
+.qbrand-sparks__dot--near {
+  box-shadow: 0 0 6px color-mix(in srgb, var(--qsidebar-accent, currentColor) 65%, transparent);
+}
+
+/* One revolution of the orbit group about the label centre.
+ *
+ * The `from` state is `none`, NOT a rotation: the group's static ellipse tilt
+ * already arrives as an inline `transform`. An inline transform beats a
+ * stylesheet keyframe for the whole animation while one is running, so baking
+ * the tilt into the keyframes would either be ignored or fight the inline
+ * value. Starting from `none` and ending at 360deg means the keyframe's rotate
+ * composes over nothing, and 360deg is visually identical to 0 — the visual
+ * jump at the loop point is zero even though the declared start differs. */
+@keyframes qubit-brand-orbit {
+  from {
+    transform: none;
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Depth cycle: one period == half a revolution, so a spark reaches full size
+ * and brightness on the near half of its ellipse and bottoms out exactly as it
+ * crosses to the far half. Only scale and opacity animate — never layout.
+ *
+ * The depth transform deliberately does NOT carry the orbital offset. That
+ * offset is a second animated transform on the same element (the dot's inline
+ * rotate/translateX/scaleY), and CSS animations on one property do not stack:
+ * the real stack is one wrapper per axis. So the dot keeps its orbital
+ * placement untouched and the depth only changes its own scale — the spark
+ * grows and recedes in place on the ellipse, which is exactly the parallax
+ * cue the eye reads as depth. */
+@keyframes qubit-brand-depth {
+  0% {
+    /* Furthest point: small and faint. */
+    opacity: var(--spark-floor, 0.1);
+    /* The inverse squash rides along inside the scale: the keyframe owns
+     * `transform` outright, so the counter-scale has to be part of it or it
+     * would be discarded and the particle would flatten to a sliver. */
+    transform: scale(0.5) scaleY(var(--spark-unsquash, 1));
+  }
+  50% {
+    /* Nearest point: full size, and as bright as the plane allows. */
+    opacity: var(--spark-peak, 0.9);
+    transform: scale(1.2) scaleY(var(--spark-unsquash, 1));
+  }
+  100% {
+    opacity: var(--spark-floor, 0.1);
+    transform: scale(0.5) scaleY(var(--spark-unsquash, 1));
+  }
+}
+
+/* Hover: the cloud energises — the orbits speed up and the near plane brightens
+ * a little further, so the effect reads as interest rather than stillness. */
+.qagent-sidebar__brand-row:hover .qbrand-sparks__orbit,
+.qagent-sidebar__brand-row:focus-within .qbrand-sparks__orbit {
+  animation-duration: 5.6s;
+}
+
+.qagent-sidebar__brand-row:hover .qbrand-sparks__dot,
+.qagent-sidebar__brand-row:focus-within .qbrand-sparks__dot {
+  animation-duration: 2.8s;
+}
+
+.qbrand-sparks__orbit,
+.qbrand-sparks__dot {
+  transition: animation-duration 320ms ease;
+}
+
+/* ---------- Reduced motion: everything rests ---------- */
+
+@media (prefers-reduced-motion: reduce) {
+  .qubit-mark__plane,
+  .qubit-mark__ring,
+  .qubit-mark__nucleus,
+  .qubit-mark__bead,
+  .qubit-mark__mote,
+  .qubit-mark__field,
+  .qbrand-sparks__dot,
+  .qagent-sidebar .qagent-sidebar__brand-name,
+  .qagent-sidebar .qagent-sidebar__brand-row > div:first-child > .qagent-sidebar__brand-name {
+    animation: none !important;
+    transition: none !important;
+  }
+  .qbrand-sparks {
+    display: none;
+  }
+  /* Frozen at a static 3D pose: each plane is left at a different opening angle
+   * so the mark still reads as an atom, just still. scaleY here replaces the
+   * animation's face-on 0% frame, which would flatten all three rings. */
+  .qubit-mark__plane {
+    transform: scale(1, 0.78);
+  }
+  .qubit-mark__field--far .qubit-mark__plane {
+    transform: scale(1, 0.42);
+  }
+  .qubit-mark__field--deep .qubit-mark__plane {
+    transform: scale(1, 0.9);
+  }
+  .qubit-mark__field--mid .qubit-mark__plane {
+    transform: scale(1, 0.61);
+  }
+  .qubit-mark__field--closest .qubit-mark__plane {
+    transform: scale(1, 0.5);
+  }
+  .qubit-mark__bead {
+    opacity: 0.9;
+  }
+  .qagent-sidebar .qagent-sidebar__brand-name {
+    -webkit-text-fill-color: currentColor;
+    background-image: none;
+  }
+  .qagent-sidebar__brand-row:hover .qubit-mark__field,
+  .qagent-sidebar__brand-row:hover .qubit-mark__field--far,
+  .qagent-sidebar__brand-row:hover .qubit-mark__field--near {
+    transform: none;
+  }
+}
