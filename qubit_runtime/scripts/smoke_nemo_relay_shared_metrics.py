@@ -1,0 +1,976 @@
+"""Run a real Qubit CLI turn and validate the Relay shared-metrics output."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from contextlib import closing
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+
+
+PROMPT_CANARY = "relay-smoke-sensitive-prompt"
+MODEL_CANARY = "gpt-relay-smoke-sensitive-model"
+RESPONSE_CANARY = "relay-smoke-sensitive-response"
+TOOL_CALL_CANARY = "relay-smoke-sensitive-tool-call"
+TOOL_RESULT_CANARY = "relay-smoke-sensitive-tool-result"
+TOOL_FILE = "relay-smoke-input.txt"
+SKILL_CANARY = "relay-smoke-private-agent-skill"
+INSTALLED_SKILL_CANARY = "relay-smoke-private-installed-skill"
+
+
+def _resolve_qubit_executable(qubit_repo: Path) -> Path:
+    for relative_path in (
+        Path(".venv") / "bin" / "qubit",
+        Path(".venv") / "Scripts" / "qubit.exe",
+    ):
+        candidate = qubit_repo / relative_path
+        if candidate.is_file():
+            return candidate
+    discovered = shutil.which("qubit")
+    if discovered:
+        return Path(discovered)
+    raise SystemExit(
+        "Qubit executable not found in the repository virtual environment "
+        "or on PATH"
+    )
+
+
+class _ModelHandler(BaseHTTPRequestHandler):
+    """Minimal OpenAI-compatible model server for one deterministic turn."""
+
+    protocol_version = "HTTP/1.1"
+    requests: list[dict[str, Any]] = []
+
+    def do_GET(self) -> None:
+        if self.path.rstrip("/") != "/v1/models":
+            self.send_error(404)
+            return
+        self._write_json({
+            "object": "list",
+            "data": [
+                {
+                    "id": MODEL_CANARY,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "smoke-test",
+                }
+            ],
+        })
+
+    def do_POST(self) -> None:
+        if self.path.rstrip("/") != "/v1/chat/completions":
+            self.send_error(404)
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        request = json.loads(self.rfile.read(length) or b"{}")
+        type(self).requests.append(request)
+        request_tool = not any(
+            message.get("role") == "tool"
+            for message in request.get("messages") or []
+            if isinstance(message, dict)
+        )
+        if request.get("stream"):
+            self._write_stream(request_tool=request_tool)
+        else:
+            self._write_json(self._completion(request_tool=request_tool))
+
+    def _completion(self, *, request_tool: bool) -> dict[str, Any]:
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": "" if request_tool else RESPONSE_CANARY,
+        }
+        finish_reason = "tool_calls" if request_tool else "stop"
+        if request_tool:
+            message["tool_calls"] = [
+                {
+                    "id": TOOL_CALL_CANARY,
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": json.dumps({"path": TOOL_FILE}),
+                    },
+                }
+            ]
+        return {
+            "id": "chatcmpl-relay-smoke",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": MODEL_CANARY,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": finish_reason,
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 1,
+                "total_tokens": 11,
+            },
+        }
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return
+
+    def _write_json(self, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+
+    def _write_stream(self, *, request_tool: bool) -> None:
+        now = int(time.time())
+        chunks: list[dict[str, Any]] = [
+            {
+                "id": "chatcmpl-relay-smoke",
+                "object": "chat.completion.chunk",
+                "created": now,
+                "model": MODEL_CANARY,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "content": "",
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            }
+        ]
+        if request_tool:
+            chunks.append({
+                "id": "chatcmpl-relay-smoke",
+                "object": "chat.completion.chunk",
+                "created": now,
+                "model": MODEL_CANARY,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": TOOL_CALL_CANARY,
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": json.dumps({"path": TOOL_FILE}),
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            })
+        else:
+            chunks.append({
+                "id": "chatcmpl-relay-smoke",
+                "object": "chat.completion.chunk",
+                "created": now,
+                "model": MODEL_CANARY,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": RESPONSE_CANARY},
+                        "finish_reason": None,
+                    }
+                ],
+            })
+        chunks.extend([
+            {
+                "id": "chatcmpl-relay-smoke",
+                "object": "chat.completion.chunk",
+                "created": now,
+                "model": MODEL_CANARY,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "tool_calls" if request_tool else "stop",
+                    }
+                ],
+            },
+            {
+                "id": "chatcmpl-relay-smoke",
+                "object": "chat.completion.chunk",
+                "created": now,
+                "model": MODEL_CANARY,
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 1,
+                    "total_tokens": 11,
+                },
+            },
+        ])
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        for chunk in chunks:
+            self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+            self.wfile.flush()
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+        self.close_connection = True
+
+
+def _arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--qubit-repo",
+        type=Path,
+        default=Path.cwd(),
+        help="Qubit source checkout containing .venv/bin/qubit",
+    )
+    parser.add_argument(
+        "--relay-python",
+        type=Path,
+        default=None,
+        help="Optional NeMo Relay checkout's python directory",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory for the isolated QUBIT_HOME and captured output",
+    )
+    return parser.parse_args()
+
+
+def _stop_auto_started_gateway(home: Path, timeout: float = 60.0) -> None:
+    """Stop the gateway the one-shot chat auto-started for ``home`` and wait for it to exit.
+
+    Left alone it lingers for ``gateway.unmanaged_idle_exit_seconds`` after every smoke run. Only the
+    live process the gateway's own identity check proves is ``home``'s gateway (start time, gateway
+    command line, home) is signalled: a stale ``gateway.pid`` whose PID was recycled is left alone.
+    """
+    import psutil
+    from gateway.status import live_gateway_pid_for_home
+
+    pid = live_gateway_pid_for_home(home)
+    if pid is None:
+        return
+    try:
+        gateway = psutil.Process(pid)  # binds the create time: terminate() refuses a reused PID
+        gateway.terminate()
+        gateway.wait(timeout=timeout)
+    except psutil.NoSuchProcess:
+        return
+    except psutil.TimeoutExpired as exc:
+        raise AssertionError(
+            f"Auto-started gateway {pid} did not exit within {timeout:.0f}s"
+        ) from exc
+
+
+def _write_config(home: Path, port: int) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        f"""model:
+  default: {MODEL_CANARY}
+  provider: custom
+  base_url: http://127.0.0.1:{port}/v1
+  api_mode: chat_completions
+  api_key: no-key-required
+security:
+  tirith_enabled: false
+auxiliary:
+  title_generation:
+    enabled: false
+telemetry:
+  shared_metrics:
+    enabled: true
+""",
+        encoding="utf-8",
+    )
+
+
+# ---- iuf c1 ----
+# The final receipt of an update whose fetch failed before the checkout moved: the plan and snapshot
+# stages carry end marks, the apply stage it died in carries none.
+UPDATE_RECEIPT: dict[str, Any] = {
+    "schema": 1, "update_id": "0123456789abcdef",
+    "started_at": "2026-10-06T10:00:00+00:00", "finished_at": "2026-10-06T10:00:01+00:00",
+    "outcome": "failed", "exit_code": 1, "stop_reason": "sys.exit(1)", "pre_update": {},
+    "stop_class": "fetch_failed",
+    "stages": [
+        {"name": "plan", "outcome": "success", "at": "2026-10-06T10:00:00+00:00"},
+        {"name": "snapshot", "outcome": "skipped", "at": "2026-10-06T10:00:00+00:00"},
+    ],
+    "steps": [], "fleet": [],
+}
+# The offline probes in the skill-lifecycle subprocess: one failed URL plugin install and one failed
+# update run (UPDATE_RECEIPT), identical in SQLite and in the export.
+FAILURE_EXPECTED_DIMENSIONS = {
+    "qubit.extension.install.count": {
+        "failure_class": "clone_failed", "kind": "plugin", "name": "custom", "outcome": "failed",
+        "registry": "none", "source": "local",
+    },
+    "qubit.update.run": {
+        "apply_mode": "unknown", "duration_bucket": "lt_30s", "failed_stage": "apply",
+        "failure_class": "fetch_failed", "from_version_age_bucket": "unknown", "kind": "cli",
+        "outcome": "failed",
+    },
+}
+
+
+def expected_update_stages() -> list[tuple[str, str]]:
+    """One row per marked stage of UPDATE_RECEIPT, plus a failed row for the stage the run died in:
+    stage marks are end marks, so the apply stage the fetch failure stopped has none of its own."""
+    marked = [(stage["name"], stage["outcome"]) for stage in UPDATE_RECEIPT["stages"]]
+    died_in = FAILURE_EXPECTED_DIMENSIONS["qubit.update.run"]["failed_stage"]
+    return sorted([*marked, (died_in, "failed")])
+
+
+def _validate_exact_rows(rows: dict[str, list[dict[str, Any]]], expected: dict[str, dict[str, str]]) -> None:
+    for name, dimensions in expected.items():
+        if [row["dimensions"] for row in rows[name]] != [dimensions] or rows[name][0]["value"] != 1:
+            raise AssertionError(f"Unexpected {name}: {rows[name]}")
+
+
+def _validate_failure_rows(rows: dict[str, list[dict[str, Any]]]) -> None:
+    _validate_exact_rows(rows, FAILURE_EXPECTED_DIMENSIONS)
+    stages = sorted((row["dimensions"]["stage"], row["dimensions"]["outcome"]) for row in rows["qubit.update.stage"])
+    if stages != expected_update_stages():
+        raise AssertionError(f"Unexpected update stages: {rows['qubit.update.stage']}")
+# ---- end iuf c1 ----
+
+
+# One interactive turn (2 model calls, 1 read_file) on the canary custom model: the v5 per-turn,
+# per-conversation rows it must produce, identical in SQLite and in the export. The agent-created
+# skill is Qubit' own work, so it records no feature_adoption row (the exact name sets assert that).
+V5_EXPECTED_DIMENSIONS = {
+    "qubit.task_cost.count": {
+        "api_calls_bucket": "2", "model": "custom", "outcome": "completed", "provider": "custom",
+        "tokens_bucket": "lt_2k", "tool_calls_bucket": "1",
+    },
+    "qubit.tool_output_truncation.count": {"original_size_bucket": "lt_1k", "tool": "read_file", "truncated": "no"},
+    "qubit.tool_enabled_unused.count": {"toolset": "file", "used": "yes"},
+}
+
+
+def _validate_v5_rows(rows: dict[str, list[dict[str, Any]]]) -> None:
+    _validate_exact_rows(rows, V5_EXPECTED_DIMENSIONS)
+    [overhead] = rows["qubit.tool_overhead.count"]  # the file toolset's 4 tools, schema tokens estimated
+    if (
+        overhead["value"] != 1
+        or overhead["dimensions"]["execution_surface"] != "cli"
+        or overhead["dimensions"]["enabled_tool_count_bucket"] != "3_to_5"
+        or overhead["dimensions"]["tool_schema_tokens_bucket"] in {"0", "unknown"}
+    ):
+        raise AssertionError(f"Unexpected tool overhead: {overhead}")
+
+
+# A one-shot chat is served by the gateway it auto-starts for the home (unified gateway runtime): that
+# gateway reports its own boot latency and the local platform's delivery and first-reply latency for
+# the turn. The turn's single read_file call is one tool batch.
+GATEWAY_TURN_EXPECTED_DIMENSIONS = {
+    "qubit.platform.delivery": {"failure_class": "none", "outcome": "sent", "platform": "local"},
+    "qubit.tool_batch.count": {"connector_share": "none", "model": "custom", "provider": "custom", "size_bucket": "1"},
+}
+# Each process that launched once reports one startup row: the chat client and the gateway it started.
+EXPECTED_STARTUP_SURFACES = ("cli", "gateway_boot")
+
+
+def _validate_gateway_turn_rows(rows: dict[str, list[dict[str, Any]]]) -> None:
+    _validate_exact_rows(rows, GATEWAY_TURN_EXPECTED_DIMENSIONS)
+    replies = rows["qubit.gateway.reply_latency"]  # the bucket is whatever the host's load made it
+    if any(row["dimensions"]["platform"] != "local" for row in replies) or sum(row["value"] for row in replies) != 1:
+        raise AssertionError(f"Unexpected gateway reply latency: {replies}")
+    startup = rows["qubit.startup.latency"]
+    if sorted(row["dimensions"]["surface"] for row in startup) != sorted(EXPECTED_STARTUP_SURFACES) or any(
+        row["value"] != 1 for row in startup
+    ):
+        raise AssertionError(f"Unexpected startup latency: {startup}")
+
+
+# The metric names the scenario must produce, exactly, in SQLite and in the export.
+EXPECTED_METRIC_NAMES = frozenset({
+    "qubit.client.active",
+    "qubit.context_peak.count",
+    "qubit.extension.install.count",  # iuf c1
+    "qubit.gateway.reply_latency",
+    "qubit.install.milestone",
+    "qubit.install.snapshot",
+    "qubit.model_reply_issue.count",
+    "qubit.model_route.count",
+    "qubit.model_tokens.sum",
+    "qubit.model_tool_quality.count",
+    "qubit.platform.delivery",
+    "qubit.session.count",
+    "qubit.skill.lifecycle.count",
+    "qubit.skill.load.count",
+    "qubit.startup.latency",
+    "qubit.task_cost.count",
+    "qubit.task_run.duration",
+    "qubit.task_run.finished",
+    "qubit.task_run.started",
+    "qubit.tool.usage.count",
+    "qubit.tool_batch.count",
+    "qubit.tool_call.count",
+    "qubit.tool_call.latency",
+    "qubit.tool_enabled_unused.count",
+    "qubit.tool_output_truncation.count",
+    "qubit.tool_overhead.count",
+    "qubit.update.run",  # iuf c1
+    "qubit.update.stage",  # iuf c1
+})
+
+
+def _read_counters(database_path: Path) -> list[dict[str, Any]]:
+    # Read-only: polling must never create the store before the gateway does.
+    with closing(sqlite3.connect(f"{database_path.as_uri()}?mode=ro", uri=True)) as connection:
+        rows = connection.execute(
+            """
+            SELECT metric_name, dimensions_json, value, packaged_value
+            FROM counter_aggregates
+            ORDER BY metric_name, dimensions_json
+            """
+        ).fetchall()
+    return [
+        {
+            "name": name,
+            "dimensions": json.loads(dimensions),
+            "value": value,
+            "packaged_value": packaged_value,
+        }
+        for name, dimensions, value, packaged_value in rows
+    ]
+
+
+def _by_name(counters: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    for counter in counters:
+        by_name.setdefault(counter["name"], []).append(counter)
+    return by_name
+
+
+def _wait_for_gateway_turn_rows(database_path: Path, timeout: float = 30.0) -> bool:
+    """Poll the probe home's store until the auto-started gateway's turn rows have landed.
+
+    The gateway records them after the reply reached the chat client, and stopping it does not
+    settle them: its graceful exit ends in ``os._exit``, which skips the shared-metrics flush. So the
+    smoke waits for the rows before it stops the gateway. False when ``timeout`` passed first.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            _validate_gateway_turn_rows(_by_name(_read_counters(database_path)))
+            return True
+        except (sqlite3.Error, KeyError, AssertionError):
+            if time.monotonic() >= deadline:
+                return False
+        time.sleep(0.25)
+
+
+def _validate_store(database_path: Path) -> list[dict[str, Any]]:
+    if not database_path.is_file():
+        raise AssertionError(f"Metrics database was not created: {database_path}")
+    counters = _read_counters(database_path)
+    by_name = _by_name(counters)
+    if set(by_name) != EXPECTED_METRIC_NAMES:
+        raise AssertionError(
+            f"Unexpected SQLite counters:\n{json.dumps(counters, indent=2)}"
+        )
+    if by_name["qubit.client.active"] != [
+        {
+            "name": "qubit.client.active",
+            "dimensions": {},
+            "value": 1,
+            "packaged_value": 1,
+        }
+    ]:
+        raise AssertionError(
+            f"Unexpected client-active counter: {by_name['qubit.client.active']}"
+        )
+    # Two primary calls; each lands in whatever TTFT bucket the host's load put it in.
+    models = by_name["qubit.model_route.count"]
+    expected_model = {
+        "call_role": "primary", "error_class": "none", "model": "custom", "outcome": "success",
+        "provider": "custom",
+    }
+    if (
+        any({k: v for k, v in m["dimensions"].items() if k != "ttft_bucket"} != expected_model for m in models)
+        or sum(m["value"] for m in models) != 2
+        or sum(m["packaged_value"] for m in models) != 2
+    ):
+        raise AssertionError(
+            f"Unexpected model counter: {by_name['qubit.model_route.count']}"
+        )
+    expected_start = {
+        "name": "qubit.task_run.started",
+        "dimensions": {
+            "entrypoint": "one_shot",
+            "execution_surface": "cli",
+            "platform": "none",
+        },
+        "value": 1,
+        "packaged_value": 1,
+    }
+    if by_name["qubit.task_run.started"] != [expected_start]:
+        raise AssertionError(
+            f"Unexpected task start: {by_name['qubit.task_run.started']}"
+        )
+    [terminal] = by_name["qubit.task_run.finished"]
+    expected_terminal_dimensions = {
+        "end_reason": "completed",
+        "entrypoint": "one_shot",
+        "execution_surface": "cli",
+        "failure_class": "none",
+        "outcome": "success",
+        "platform": "none",
+        "termination": "none",
+    }
+    if (
+        terminal["dimensions"] != expected_terminal_dimensions
+        or terminal["value"] != 1
+        or terminal["packaged_value"] != 1
+    ):
+        raise AssertionError(f"Unexpected task terminal counter: {terminal}")
+    [duration] = by_name["qubit.task_run.duration"]
+    if duration["dimensions"] != {
+        "duration_bucket": duration["dimensions"].get("duration_bucket"),
+        "execution_surface": "cli", "outcome": "success", "retry_count_bucket": "0",
+    } or duration["value"] != 1:
+        raise AssertionError(f"Unexpected task duration counter: {duration}")
+    [cost] = by_name["qubit.task_cost.count"]
+    if (cost["dimensions"]["api_calls_bucket"], cost["dimensions"]["tool_calls_bucket"]) != ("2", "1"):
+        raise AssertionError(f"Unexpected task cost counter: {cost}")
+    if [c["dimensions"] for c in by_name["qubit.tool.usage.count"]] != [
+        {"error_class": "none", "outcome": "success", "tool_name": "read_file"}
+    ]:
+        raise AssertionError(f"Unexpected tool usage: {by_name['qubit.tool.usage.count']}")
+    [snapshot] = by_name["qubit.install.snapshot"]
+    if (
+        snapshot["value"] != 1 or snapshot["dimensions"]["memory_provider"] != "builtin"
+        # The smoke config leaves compression.prepare_ahead at its default.
+        or snapshot["dimensions"]["compression_prepare_ahead"] != "off"
+    ):
+        raise AssertionError(f"Unexpected install snapshot: {snapshot}")
+    [session] = by_name["qubit.session.count"]
+    if (session["dimensions"]["turn_count_bucket"], session["dimensions"]["last_outcome"]) != (
+        "1", "success",
+    ):
+        raise AssertionError(f"Unexpected session summary: {session}")
+    tokens = {c["dimensions"]["token_type"]: c["value"] for c in by_name["qubit.model_tokens.sum"]}
+    if tokens != {"input": 20, "output": 2}:
+        raise AssertionError(f"Unexpected token sums: {by_name['qubit.model_tokens.sum']}")
+    [quality] = by_name["qubit.model_tool_quality.count"]
+    if quality["dimensions"] != {"call_role": "primary", "issue": "none", "model": "custom", "provider": "custom"}:
+        raise AssertionError(f"Unexpected tool-call quality: {quality}")
+    [reply] = by_name["qubit.model_reply_issue.count"]  # both scripted replies are usable
+    if (reply["dimensions"], reply["value"]) != ({"issue": "none", "model": "custom", "provider": "custom"}, 2):
+        raise AssertionError(f"Unexpected model reply issues: {reply}")
+    [peak] = by_name["qubit.context_peak.count"]
+    if (peak["dimensions"]["provider"], peak["dimensions"]["model"], peak["dimensions"]["limit_hit"]) != (
+        "custom", "custom", "no",
+    ):
+        raise AssertionError(f"Unexpected context peak: {peak}")
+    milestones = {c["dimensions"]["milestone"] for c in by_name["qubit.install.milestone"]}
+    if not {"first_task_started", "first_task_success", "first_tool_success"} <= milestones:
+        raise AssertionError(f"Missing install milestones: {sorted(milestones)}")
+    [tool] = by_name["qubit.tool_call.count"]
+    expected_tool_dimensions = {
+        "approval_outcome": "not_required", "outcome": "success", "tool_category": "file",
+    }
+    [latency] = by_name["qubit.tool_call.latency"]
+    if (
+        tool["dimensions"] != expected_tool_dimensions
+        or latency["dimensions"]["latency_bucket"] == "unknown"
+        or (latency["dimensions"]["retry_count_bucket"], latency["dimensions"]["tool_category"]) != ("unknown", "file")
+        or tool["value"] != 1
+        or tool["packaged_value"] != 1
+    ):
+        raise AssertionError(f"Unexpected tool counter: {tool}")
+    lifecycle = by_name["qubit.skill.lifecycle.count"]
+    expected_actions = {
+        "archived",
+        "created",
+        "edited",
+        "installed",
+        "patched",
+        "restored",
+        "stale",
+    }
+    if (
+        {counter["dimensions"]["action"] for counter in lifecycle} != expected_actions
+        or any(counter["value"] != 1 for counter in lifecycle)
+        or any(counter["packaged_value"] != 1 for counter in lifecycle)
+    ):
+        raise AssertionError(f"Unexpected skill lifecycle counters: {lifecycle}")
+    loads = by_name["qubit.skill.load.count"]
+    expected_load_states = {
+        ("first_use", "not_applicable", "1"),
+        ("reused", "no_new_patch", "2"),
+        ("reused", "reused_after_patch", "3_to_5"),
+    }
+    observed_load_states = {
+        (
+            counter["dimensions"]["reuse_state"],
+            counter["dimensions"]["post_patch_state"],
+            counter["dimensions"]["use_count_bucket"],
+        )
+        for counter in loads
+    }
+    if (
+        observed_load_states != expected_load_states
+        or any(counter["value"] != 1 for counter in loads)
+        or any(counter["packaged_value"] != 1 for counter in loads)
+    ):
+        raise AssertionError(f"Unexpected skill load counters: {loads}")
+    _validate_v5_rows(by_name)
+    _validate_gateway_turn_rows(by_name)
+    _validate_failure_rows(by_name)  # iuf c1
+    return counters
+
+
+def _validate_packages(
+    outbox: Path,
+    schema_path: Path,
+) -> tuple[list[Path], list[dict[str, Any]]]:
+    package_paths = sorted(outbox.glob("*.json"))
+    if len(package_paths) != 2:
+        raise AssertionError(
+            f"Expected two delta packages in {outbox}, found {len(package_paths)}"
+        )
+    try:
+        import jsonschema
+    except ImportError as exc:
+        raise RuntimeError(
+            "The Qubit development environment requires jsonschema"
+        ) from exc
+    schema = json.loads(schema_path.read_text(encoding="utf-8-sig"))
+    packages = [
+        json.loads(package_path.read_text(encoding="utf-8-sig"))
+        for package_path in package_paths
+    ]
+    for package in packages:
+        jsonschema.validate(package, schema)
+        if set(package["resource"]) != {
+            "architecture",
+            "qubit_version",
+            "install_method",
+            "os_family",
+        }:
+            raise AssertionError(f"Unexpected client resource: {package['resource']}")
+
+    serialized = json.dumps(packages)
+    for prohibited in (
+        MODEL_CANARY,
+        PROMPT_CANARY,
+        RESPONSE_CANARY,
+        TOOL_CALL_CANARY,
+        TOOL_RESULT_CANARY,
+        SKILL_CANARY,
+        INSTALLED_SKILL_CANARY,
+    ):
+        if prohibited in serialized:
+            raise AssertionError(
+                f"Exported package leaked prohibited value: {prohibited!r}"
+            )
+    metrics: dict[str, list[dict[str, Any]]] = {}
+    for package in packages:
+        for metric in package.get("metrics", []):
+            metrics.setdefault(metric["name"], []).append(metric)
+    if set(metrics) != EXPECTED_METRIC_NAMES:
+        raise AssertionError(
+            f"Unexpected package metrics:\n{json.dumps(metrics, indent=2)}"
+        )
+    if metrics["qubit.client.active"] != [
+        {
+            "name": "qubit.client.active",
+            "type": "counter",
+            "dimensions": {},
+            "value": 1,
+        }
+    ]:
+        raise AssertionError(
+            f"Unexpected client-active metric: {metrics['qubit.client.active']}"
+        )
+    models = metrics["qubit.model_route.count"]
+    if any(
+        {k: v for k, v in m["dimensions"].items() if k != "ttft_bucket"} != {
+            "call_role": "primary", "error_class": "none", "model": "custom", "outcome": "success",
+            "provider": "custom",
+        }
+        for m in models
+    ) or sum(m["value"] for m in models) != 2:
+        raise AssertionError(
+            f"Unexpected model metric: {metrics['qubit.model_route.count']}"
+        )
+    [terminal] = metrics["qubit.task_run.finished"]
+    if terminal["dimensions"] != {
+        "end_reason": "completed",
+        "entrypoint": "one_shot",
+        "execution_surface": "cli",
+        "failure_class": "none",
+        "outcome": "success",
+        "platform": "none",
+        "termination": "none",
+    }:
+        raise AssertionError(f"Unexpected task terminal metric: {terminal}")
+    [tool] = metrics["qubit.tool_call.count"]
+    if (
+        tool["dimensions"]
+        != {"approval_outcome": "not_required", "outcome": "success", "tool_category": "file"}
+        or metrics["qubit.tool_call.latency"][0]["dimensions"]["latency_bucket"] == "unknown"
+    ):
+        raise AssertionError(f"Unexpected tool metric: {tool}")
+    lifecycle = metrics["qubit.skill.lifecycle.count"]
+    if {metric["dimensions"]["action"] for metric in lifecycle} != {
+        "archived",
+        "created",
+        "edited",
+        "installed",
+        "patched",
+        "restored",
+        "stale",
+    }:
+        raise AssertionError(f"Unexpected skill lifecycle metrics: {lifecycle}")
+    loads = metrics["qubit.skill.load.count"]
+    if {
+        (
+            metric["dimensions"]["reuse_state"],
+            metric["dimensions"]["post_patch_state"],
+            metric["dimensions"]["use_count_bucket"],
+        )
+        for metric in loads
+    } != {
+        ("first_use", "not_applicable", "1"),
+        ("reused", "no_new_patch", "2"),
+        ("reused", "reused_after_patch", "3_to_5"),
+    }:
+        raise AssertionError(f"Unexpected skill load metrics: {loads}")
+    _validate_v5_rows(metrics)
+    _validate_gateway_turn_rows(metrics)
+    _validate_failure_rows(metrics)  # iuf c1
+    return package_paths, packages
+
+
+def main() -> int:
+    args = _arguments()
+    qubit_repo = args.qubit_repo.resolve()
+    # The gateway identity check must come from the tree under test, not whatever tree the venv's
+    # editable install points at.
+    sys.path.insert(0, str(qubit_repo))
+    relay_python = args.relay_python.resolve() if args.relay_python else None
+    qubit = _resolve_qubit_executable(qubit_repo)
+    if relay_python is not None and not any(
+        (relay_python / "nemo_relay").glob("_native.*")
+    ):
+        raise SystemExit(
+            "Built NeMo Relay Python binding not found under "
+            f"{relay_python}; run the Relay Python build first"
+        )
+
+    if args.output_dir:
+        root = args.output_dir.resolve()
+        if root.exists():
+            raise SystemExit(f"Refusing to replace existing output directory: {root}")
+        root.mkdir(parents=True)
+    else:
+        root = Path(tempfile.mkdtemp(prefix="qubit-relay-shared-metrics-"))
+    home = root / "qubit-home"
+    workdir = root / "workspace"
+    workdir.mkdir()
+    (workdir / TOOL_FILE).write_text(TOOL_RESULT_CANARY, encoding="utf-8")
+    home.mkdir()
+    (home / ".no-bundled-skills").touch()
+    agent_skill = home / "skills" / SKILL_CANARY
+    agent_skill.mkdir(parents=True)
+    (agent_skill / "SKILL.md").write_text(
+        f"---\nname: {SKILL_CANARY}\ndescription: private smoke skill\n---\n",
+        encoding="utf-8",
+    )
+    installed_skill = home / "skills" / INSTALLED_SKILL_CANARY
+    installed_skill.mkdir(parents=True)
+    (installed_skill / "SKILL.md").write_text(
+        f"---\nname: {INSTALLED_SKILL_CANARY}\ndescription: installed smoke skill\n---\n",
+        encoding="utf-8",
+    )
+    hub_state = home / "skills" / ".hub"
+    hub_state.mkdir()
+    (hub_state / "lock.json").write_text(
+        json.dumps({
+            "version": 1,
+            "installed": {
+                INSTALLED_SKILL_CANARY: {"source": "smoke/local"},
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    _ModelHandler.requests = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _ModelHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        _write_config(home, server.server_port)
+        env = os.environ.copy()
+        env["QUBIT_HOME"] = str(home)
+        python_paths = [str(qubit_repo)]
+        if relay_python is not None:
+            python_paths.append(str(relay_python))
+        python_paths.append(env.get("PYTHONPATH", ""))
+        env["PYTHONPATH"] = os.pathsep.join(python_paths).rstrip(os.pathsep)
+        result = subprocess.run(
+            [
+                str(qubit),
+                "chat",
+                "--query",
+                PROMPT_CANARY,
+                "--provider",
+                "custom",
+                "--model",
+                MODEL_CANARY,
+                "--quiet",
+                "--ignore-rules",
+                "--toolsets",
+                "file",
+                "--max-turns",
+                "2",
+            ],
+            cwd=workdir,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        metrics_db = home / "telemetry" / "shared_metrics" / "metrics.sqlite3"
+        if not _wait_for_gateway_turn_rows(metrics_db):
+            print(f"Gateway turn rows did not reach {metrics_db} in time", file=sys.stderr)
+        _stop_auto_started_gateway(home)
+
+    (root / "qubit.stdout.txt").write_text(result.stdout, encoding="utf-8")
+    (root / "qubit.stderr.txt").write_text(result.stderr, encoding="utf-8")
+    if result.returncode != 0:
+        raise AssertionError(
+            f"Qubit exited with {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+    if len(_ModelHandler.requests) != 2:
+        raise AssertionError(
+            f"Expected two model requests, got {len(_ModelHandler.requests)}"
+        )
+    request = _ModelHandler.requests[0]
+    if request.get("model") != MODEL_CANARY:
+        raise AssertionError(f"Unexpected model request: {request.get('model')!r}")
+    if PROMPT_CANARY not in json.dumps(request.get("messages", [])):
+        raise AssertionError("Qubit model request did not contain the prompt canary")
+    follow_up = json.dumps(_ModelHandler.requests[1].get("messages", []))
+    if TOOL_CALL_CANARY not in follow_up or TOOL_RESULT_CANARY not in follow_up:
+        raise AssertionError("Qubit did not return the tool result to the model")
+    if RESPONSE_CANARY not in result.stdout:
+        raise AssertionError("Qubit did not print the mock model response")
+
+    skill_result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "\n".join([
+                "from qubit_cli.observability import relay_shared_metrics",
+                "from tools.skill_usage import (",
+                "    STATE_ACTIVE, STATE_ARCHIVED, STATE_STALE, bump_patch,",
+                "    bump_use, record_created, record_installed, set_state,",
+                ")",
+                f"skill = {SKILL_CANARY!r}",
+                f"installed = {INSTALLED_SKILL_CANARY!r}",
+                "record_created(skill, agent_created=True)",
+                "bump_use(skill)",
+                "bump_use(skill)",
+                "bump_patch(skill)",
+                "bump_use(skill)",
+                "bump_patch(skill, action='edit')",
+                "set_state(skill, STATE_STALE)",
+                "set_state(skill, STATE_ACTIVE)",
+                "set_state(skill, STATE_ARCHIVED)",
+                "set_state(skill, STATE_ACTIVE)",
+                "record_installed(installed)",
+                # A real failing plugin install (offline: a file:// repo that does not exist) and a
+                # final update receipt whose fetch failed: each emits one row with a failure_class.
+                "from pathlib import Path",
+                "from qubit_cli.plugins_cmd import PluginOperationError, _install_plugin_core",
+                "from qubit_cli.plugins_cmd_install import recorded_install",
+                "missing = (Path.cwd() / 'no-such-plugin-repo').as_uri()",
+                "try:",
+                "    recorded_install(lambda: _install_plugin_core(missing, force=False),",
+                "                     catalog_name=None, identifier=missing)",
+                "    raise SystemExit('bogus plugin install succeeded')",
+                "except PluginOperationError:",
+                "    pass",
+                "from qubit_cli.observability.shared_metrics_update import record_update_receipt",
+                f"record_update_receipt({UPDATE_RECEIPT!r})",
+                "runtime = relay_shared_metrics._get_runtime()",
+                "assert runtime is not None",
+                "runtime.shutdown()",
+                # Production leaves same-day deltas pending. Force a package so
+                # this smoke can validate them without waiting for the next day.
+                "runtime.subscriber.store.create_and_export_package()",
+            ]),
+        ],
+        cwd=workdir,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    (root / "skills.stdout.txt").write_text(
+        skill_result.stdout,
+        encoding="utf-8",
+    )
+    (root / "skills.stderr.txt").write_text(
+        skill_result.stderr,
+        encoding="utf-8",
+    )
+    if skill_result.returncode != 0:
+        raise AssertionError(
+            f"Skill lifecycle probe exited with {skill_result.returncode}\n"
+            f"stdout:\n{skill_result.stdout}\nstderr:\n{skill_result.stderr}"
+        )
+
+    telemetry = home / "telemetry" / "shared_metrics"
+    counters = _validate_store(telemetry / "metrics.sqlite3")
+    package_paths, packages = _validate_packages(
+        telemetry / "outbox",
+        qubit_repo
+        / "qubit_cli"
+        / "observability"
+        / "schemas"
+        / "qubit.shared_metrics.v3.schema.json",
+    )
+
+    print("Qubit -> NeMo Relay shared-metrics smoke test passed")
+    print(f"Artifact directory: {root}")
+    print(f"Model requests: {len(_ModelHandler.requests)}")
+    print(f"SQLite counters: {json.dumps(counters, indent=2)}")
+    print(f"Export packages: {', '.join(str(path) for path in package_paths)}")
+    print(json.dumps(packages, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
