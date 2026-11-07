@@ -1,0 +1,145 @@
+import type { Translations } from "@/i18n/types";
+
+const BUILTIN: Record<string, keyof Translations["app"]["nav"]> = {
+  "/chat": "chat",
+  "/sessions": "sessions",
+  "/analytics": "analytics",
+  "/models": "models",
+  "/logs": "logs",
+  "/cron": "cron",
+  "/skills": "skills",
+  "/plugins": "plugins",
+  "/profiles": "profiles",
+  "/config": "config",
+  "/env": "keys",
+  "/docs": "documentation",
+  "/guide": "guide",
+};
+
+// Built-in routes without an i18n nav key. Keep these in sync with the
+// sidebar labels in App.tsx — the naive capitalize fallback below mangles
+// initialisms ("/mcp" → "Mcp") and can't match multi-word labels.
+const BUILTIN_LITERAL: Record<string, string> = {
+  "/files": "Files",
+  "/mcp": "MCP",
+  "/channels": "Channels",
+  "/webhooks": "Webhooks",
+  "/pairing": "Pairing",
+  "/system": "System",
+  // Nested builtin route — without this the naive path fallback renders the
+  // segment "new" against the parent and the header showed "Profiles/new".
+  "/profiles/new": "New Profile",
+};
+
+// Explicit identity for Qubit overlay routes that would otherwise collide with
+// a vendored tab or fall through to the naive capitalize fallback:
+//   * hidden routes (/qubit-approvals, /qubit-brand) have no plugin tab and
+//     produced mangled titles ("Qubit-approvals" / "Qubit-brand") (D13);
+//   * the duplicate surfaces (Qubit Boards vs /kanban, Runtime Inventory vs
+//     /devices) need distinct page titles, not the generic manifest label
+//     (D8/D9/D10).
+// Applied before the plugin-tab lookup, and — for the visible routes — reused
+// as the sidebar label in App.tsx so the two never drift.
+export const ROUTE_TITLES: Record<string, string> = {
+  "/qubit-chat": "Qubit Chat",
+  "/qubit-approvals": "Qubit Approvals",
+  "/qubit-brand": "Qubit Brand",
+  "/qubit-boards": "Qubit Boards",
+  "/qubit-runtime": "Runtime Inventory",
+  "/voice-edit": "Voice Editing",
+  // Family pages without an i18n nav key or plugin tab: the naive path
+  // fallback mangles them ("/agent-workspace" → "Agent-workspace",
+  // "/admin/skills-review" → "Admin/skills-review"). Titles match each
+  // page's own heading, Qubit-branded for the header.
+  "/agent-workspace": "Qubit Agent Workspace",
+  "/nodes": "Qubit Nodes",
+  "/devices": "Qubit Devices",
+  "/session-ops": "Qubit Session Ops",
+  "/worktrees": "Qubit Worktrees",
+  "/checkpoints": "Qubit Checkpoints",
+  "/qubit-board-admin": "Qubit Board Admin",
+  "/qubit-task-inbox": "Qubit Task Inbox",
+  "/qubit-talk": "Voice & Speech",
+  "/qubit-scheduler": "Tasks & Scheduling",
+  "/admin/skills-review": "Skills Review Queue",
+  "/admin/mcp-calls": "Gateway MCP Calls",
+  "/admin/users": "Operator & Credentials",
+  "/canvas": "Qubit Canvas",
+  "/qubit-office": "Qubit Office",
+  // The three-panel workspace. Same reachability rule as the HUD above: the
+  // route exists in App.tsx, but a route with no SIDEBAR_SECTIONS path and no
+  // builtin nav row is a page nobody can click.
+  "/qubit-workbench": "Qubit Workbench",
+  // HUD is a hidden-tab plugin (its manifest keeps "hidden": true so no extra
+  // auto tab is generated); it reaches the sidebar as an App.tsx builtin entry
+  // grouped in the System section. Without this the header fell through to the
+  // naive fallback and rendered "Qubit-hud".
+  "/qubit-hud": "Qubit HUD",
+  "/qubit-office2": "Agent Quest",
+  "/qubit-office3": "Voice Chat",
+  "/qubit-taskflows": "Qubit Taskflows",
+  "/qubit-tasks": "Qubit Tasks",
+  "/qubit-memory": "Memory Providers",
+  "/webchat": "WebChat",
+  // Integrator lane 3: the Bot / Harness Router / Open Viking console.
+  // Page-documented paths (the pages link to these); titles match each
+  // page's own heading.
+  "/qubit-bot": "Qubit Bot",
+  "/qubit-harness-router": "Harness Router",
+  // `/open-viking` now renders the EMBEDDED upstream studio (the :1933 SPA),
+  // not the old local-engine console.
+  "/open-viking": "Open Viking Studio",
+  // The local context engine's console, moved off the group root when the
+  // studio took it over. Without this entry the header falls through to the
+  // naive de-slug fallback and renders "Open-viking/context-store".
+  "/open-viking/context-store": "Context Store",
+  "/open-viking/retrieval": "Retrieval",
+  "/open-viking/uploads": "Uploads",
+  "/open-viking/agent-hub": "Agent Hub",
+  "/open-viking/resources": "Resources",
+  // Agent console surfaces (computer workspace + typed agent cards). Paths
+  // need explicit titles or the naive fallback mangles them
+  // ("/agent-cards" -> "Agent-cards").
+  "/computer": "Agent Computer",
+  "/agent-cards": "Agent Work & Artifacts",
+  // Kitchen: the intake surface for absorbing other agents/apps.
+  "/kitchen": "Kitchen",
+  // OmniRoute: local AI-gateway console (status + wiring page).
+  "/omniroute": "OmniRoute Gateway",
+  // Qubit TV: streaming launcher + YouTube embed (web variant of the MIT
+  // HermesTV desktop plugin).
+  "/qubit-tv": "Qubit TV",
+};
+
+export function resolvePageTitle(
+  pathname: string,
+  t: Translations,
+  pluginTabs: { path: string; label: string }[],
+): string {
+  const normalized = pathname.replace(/\/$/, "") || "/";
+  if (normalized === "/") {
+    return t.app.nav.sessions;
+  }
+  const explicit = ROUTE_TITLES[normalized];
+  if (explicit) {
+    return explicit;
+  }
+  const plugin = pluginTabs.find((p) => p.path === normalized);
+  if (plugin) {
+    return plugin.label;
+  }
+  const key = BUILTIN[normalized];
+  if (key) {
+    return t.app.nav[key];
+  }
+  const literal = BUILTIN_LITERAL[normalized];
+  if (literal) {
+    return literal;
+  }
+  // Derive title from pathname: "/profiles" → "Profiles"
+  const segment = normalized.slice(1);
+  if (segment) {
+    return segment.charAt(0).toUpperCase() + segment.slice(1);
+  }
+  return t.app.webUi;
+}
