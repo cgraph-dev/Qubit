@@ -1,0 +1,62 @@
+name: windows-ci
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python version
+        run: python --version
+      - name: Compile the runtime and tests
+        run: python -m compileall -q qubit_runtime/qubit_cli qubit_runtime/gateway qubit_runtime/tools qubit_runtime/tests
+      - name: Install the runtime and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # The E2E conftest imports the gateway/plugin surface through the
+          # root package; install the same dependency set the Linux lanes use
+          # instead of a partial runtime-only environment.
+          python -m pip install -e ".[test]"
+          python -m pip install pytest-asyncio
+          # The ConPTY case drives the classic CLI through pywinpty. The runtime only
+          # declares it for Python >= 3.14; this lane runs 3.12, so install the same pin
+          # the Windows install-E2E lane uses.
+          python -m pip install "pywinpty==3.0.5"
+      - name: Collect the core Windows e2e suites
+        working-directory: qubit_runtime
+        run: >
+          python -m pytest --collect-only -q -m "" -p no:cacheprovider
+          tests/e2e/core/windows tests/e2e/core/windows_update
+      - name: Collect every other Windows-specific test file
+        working-directory: qubit_runtime
+        shell: pwsh
+        run: |
+          $paths = @(Get-ChildItem -Recurse -File -Path tests -Filter "*windows*.py" |
+            Where-Object { $_.FullName -notmatch "tests[\\/]e2e[\\/]core[\\/]windows" } |
+            ForEach-Object { $_.FullName })
+          if ($paths.Count -eq 0) { throw "no Windows-specific test files found" }
+          python -m pytest --collect-only -q -m "" -p no:cacheprovider `
+            --continue-on-collection-errors @paths
+      - name: Run the core Windows e2e suites
+        working-directory: qubit_runtime
+        env:
+          QUBIT_E2E_WINDOWS_INSTALL: "0"
+          # GitHub-hosted Windows runs every step inside a Job Object that denies
+          # CREATE_BREAKAWAY_FROM_JOB (WinError 5), so the strict unmanaged-gateway spawn
+          # would refuse to start at all. That job outlives this suite, so the contained
+          # gateway is correct here; the flag is off by default and the strict contract
+          # still holds on a normal Windows host. This enables the real suite; it does not
+          # skip or relax any test.
+          HERMES_WINDOWS_GATEWAY_ALLOW_BREAKAWAY_FALLBACK: "1"
+        run: >
+          python -m pytest -q -m platforms -p no:cacheprovider
+          tests/e2e/core/windows
