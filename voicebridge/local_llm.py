@@ -1,0 +1,1078 @@
+"""Tiny local LLM chat for short conversational turns.
+
+The resident brain is `qubit-brain` (Qwen3-4B abliterated, /no_think
+switch applied by the shared payload builders; Packet 4B sanitized artifact). It answers brief utterances locally in ~0.3s with zero
+network; DeepSeek still handles long/complex/web asks. Falls back cleanly
+(returns "") when ollama is down or the model isn't pulled, so the caller
+goes to the cloud path.
+"""
+from __future__ import annotations
+
+import http.client
+import json
+import os
+import re
+import socket
+import threading
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from .logging_setup import log_event
+from . import resources
+
+SYSTEM_PROMPT = (
+    "You are Qubit, a warm personal voice assistant. Answer briefly in 1-3 short "
+    "sentences unless asked for detail. Be direct: no emojis, no pleasantries, "
+    "no filler words - say only what\u0027s needed. Personal facts about the operator "
+    "(name, projects, preferences) arrive as request-time context from the Qubit "
+    "context compiler; use them when present and never invent them. "
+    "You understand broken English, heavy accents, and typos — infer the intended meaning and respond helpfully (never mock). "
+    "LANGUAGE: You speak ENGLISH ONLY. Always reply in plain English, regardless of "
+    "what language the user used. Never reply in Romanian or any other language."
+)
+
+# Packet 8T-F: reasoning-effort budgets. Per-request num_predict presets
+# only — runner options (num_ctx, placement, keep-alive) are never touched,
+# so selecting a level cannot evict or reload the resident model. Unknown
+# levels fail closed to the default budget.
+#
+# The accepted set MUST match the canonical ladder the reference/vendored
+# runtime exposes — ``qubit_constants.VALID_REASONING_EFFORTS`` plus ``none``
+# (thinking off): none, minimal, low, medium, high, xhigh, max, ultra. The
+# dashboard picker offers exactly that ladder, so a level it offers is always
+# accepted here and an unsupported level is rejected truthfully. Budgets stay
+# monotonic along the ladder (xhigh between high and max; ultra above max).
+REASONING_BUDGETS = {"none": 64, "minimal": 128, "low": 256,
+                     "medium": 512, "high": 1024, "xhigh": 1536,
+                     "max": 2048, "ultra": 4096}
+DEFAULT_REASONING_BUDGET = 100
+
+
+class LocalLlmCancelled(Exception):
+    """A local model call was aborted by the turn's cancel hook."""
+
+
+def _cancel_requested(cancel: Any) -> bool:
+    """True when a cancel hook (callable or Event) says stop. Never raises."""
+    if cancel is None:
+        return False
+    try:
+        if callable(cancel):
+            return bool(cancel())
+        is_set = getattr(cancel, "is_set", None)
+        if callable(is_set):
+            return bool(is_set())
+    except Exception:  # noqa: BLE001 - a broken hook must not crash the call
+        return False
+    return False
+
+
+class AbortableHTTPPost:
+    """One POST over a socket this object owns, abortable from another thread.
+
+    ``urllib`` gives no handle on the live socket, so a STOP could only wait
+    out the timeout. This keeps the ``http.client`` connection so ``abort()``
+    can ``shutdown`` it (``shutdown``, not just ``close``, is what wakes a
+    thread blocked in ``recv`` on Linux) and the call fails typed immediately.
+    Idempotent and safe to call before the socket exists or more than once.
+    """
+
+    def __init__(self, url: str, body: bytes, headers: Optional[dict] = None,
+                 timeout_s: float = 4.0) -> None:
+        parts = urllib.parse.urlsplit(url)
+        self._scheme = (parts.scheme or "http").lower()
+        self._host = parts.hostname or "127.0.0.1"
+        self._port = parts.port
+        self._path = parts.path or "/"
+        if parts.query:
+            self._path = f"{self._path}?{parts.query}"
+        self._body = body
+        self._headers = dict(headers or {})
+        self._timeout_s = float(timeout_s)
+        self._lock = threading.Lock()
+        self._conn: Any = None
+        self._aborted = False
+
+    def abort(self) -> bool:
+        """Shut down the live socket; returns True when one was in flight."""
+        with self._lock:
+            self._aborted = True
+            conn = self._conn
+        if conn is None:
+            return False
+        try:
+            sock = getattr(conn, "sock", None)
+            if sock is not None:
+                sock.shutdown(socket.SHUT_RDWR)
+        except Exception:  # noqa: BLE001 - abort is best-effort
+            pass
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001 - abort is best-effort
+            pass
+        return True
+
+    def post(self) -> bytes:
+        cls = (http.client.HTTPSConnection if self._scheme == "https"
+               else http.client.HTTPConnection)
+        conn = cls(self._host, self._port, timeout=self._timeout_s)
+        with self._lock:
+            if self._aborted:
+                raise LocalLlmCancelled("local model call cancelled")
+            self._conn = conn
+        try:
+            # Connect explicitly so abort() always has a live socket to shut
+            # down, even while the request is still in flight.
+            conn.connect()
+            with self._lock:
+                if self._aborted:
+                    raise LocalLlmCancelled("local model call cancelled")
+            conn.request("POST", self._path, body=self._body,
+                         headers=self._headers)
+            resp = conn.getresponse()
+            data = resp.read()
+            with self._lock:
+                if self._aborted:
+                    raise LocalLlmCancelled("local model call cancelled")
+            return data
+        except LocalLlmCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001 - abort vs real failure
+            with self._lock:
+                aborted = self._aborted
+            if aborted:
+                raise LocalLlmCancelled(
+                    "local model call cancelled") from exc
+            raise
+        finally:
+            with self._lock:
+                self._conn = None
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 - cleanup only
+                pass
+
+
+class AbortableHTTPStream:
+    """One streaming POST over a socket this object owns, abortable.
+
+    The sibling of :class:`AbortableHTTPPost`: ``http.client`` keeps the live
+    connection, so ``abort()`` can ``shutdown`` it (``shutdown``, not just
+    ``close``, wakes a thread blocked in ``recv`` on Linux) while a chunk read
+    is mid-flight. Idempotent and safe before the socket exists.
+
+    Reopenable for the bounded empty-retry path; a closed instance keeps its
+    original (non-aborted) state and opens a fresh connection.
+    """
+
+    def __init__(self, url: str, body: bytes, headers: Optional[dict] = None,
+                 timeout_s: float = 4.0) -> None:
+        parts = urllib.parse.urlsplit(url)
+        self._scheme = (parts.scheme or "http").lower()
+        self._host = parts.hostname or "127.0.0.1"
+        self._port = parts.port
+        self._path = parts.path or "/"
+        if parts.query:
+            self._path = f"{self._path}?{parts.query}"
+        self._body = body
+        self._headers = dict(headers or {})
+        self._timeout_s = float(timeout_s)
+        self._lock = threading.Lock()
+        self._conn: Any = None
+        self._live_socket: Any = None
+        self._resp: Any = None
+        self._aborted = False
+
+    def abort(self) -> bool:
+        """Shut down the live socket; returns True when one was in flight."""
+        with self._lock:
+            self._aborted = True
+            conn = self._conn
+            sock = self._live_socket
+        if sock is None and conn is not None:
+            sock = getattr(conn, "sock", None)
+        if conn is None and sock is None:
+            return False
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except Exception:  # noqa: BLE001 - abort is best-effort
+                pass
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:  # noqa: BLE001 - abort is best-effort
+            pass
+        return True
+
+    def open(self) -> "AbortableHTTPStream":
+        """Connect + send the request; returns this object for line iteration."""
+        cls = (http.client.HTTPSConnection if self._scheme == "https"
+               else http.client.HTTPConnection)
+        conn = cls(self._host, self._port, timeout=self._timeout_s)
+        with self._lock:
+            if self._aborted:
+                raise LocalLlmCancelled("local model call cancelled")
+            self._conn = conn
+        try:
+            # Connect explicitly so abort() always has a live socket to shut
+            # down, even while the request is still in flight.
+            conn.connect()
+            with self._lock:
+                if self._aborted:
+                    raise LocalLlmCancelled("local model call cancelled")
+                # ``getresponse`` hands the socket to the response when the
+                # server says Connection: close (and clears ``conn.sock``), so
+                # keep our own reference now — the socket we own, never
+                # private response internals.
+                self._live_socket = getattr(conn, "sock", None)
+            conn.request("POST", self._path, body=self._body,
+                         headers=self._headers)
+            with self._lock:
+                if self._aborted:
+                    raise LocalLlmCancelled("local model call cancelled")
+            resp = conn.getresponse()
+            with self._lock:
+                if self._aborted:
+                    raise LocalLlmCancelled("local model call cancelled")
+                self._resp = resp
+            return self
+        except LocalLlmCancelled:
+            self.close()
+            raise
+        except Exception as exc:  # noqa: BLE001 - abort vs real failure
+            with self._lock:
+                aborted = self._aborted
+            self.close()
+            if aborted:
+                raise LocalLlmCancelled(
+                    "local model call cancelled") from exc
+            raise
+
+    def __iter__(self) -> Any:
+        return iter(self._resp)
+
+    def __enter__(self) -> "AbortableHTTPStream":
+        return self
+
+    def __exit__(self, *exc_info: Any) -> bool:
+        self.close()
+        return False
+
+    def close(self) -> None:
+        """Close the owned connection; safe from any thread and repeatable."""
+        with self._lock:
+            conn, self._conn = self._conn, None
+            resp, self._resp = self._resp, None
+            self._live_socket = None
+        for obj in (resp, conn):
+            if obj is None:
+                continue
+            try:
+                obj.close()
+            except Exception:  # noqa: BLE001 - cleanup only
+                pass
+
+
+def _watch_cancel(cancel: Any, holder: AbortableHTTPPost,
+                  done: threading.Event) -> None:
+    """Poll the turn's cancel hook and abort the owned socket when it fires."""
+    while not done.wait(0.01):
+        if _cancel_requested(cancel):
+            holder.abort()
+
+
+def _abort_owned_stream(owner: Any) -> bool:
+    """``shutdown`` the owned streaming connection from the watcher thread."""
+    abort = getattr(owner, "abort", None)
+    if not callable(abort):
+        return False
+    try:
+        return bool(abort())
+    except Exception:  # noqa: BLE001 - abort is best-effort
+        return False
+
+
+def _watch_stream(cancel: Any, should_stop: Any, holder: List[Any],
+                  state: Dict[str, bool], done: threading.Event) -> None:
+    """Abort the live stream socket when either hook fires.
+
+    ``cancel`` is typed (the caller raises :class:`LocalLlmCancelled`);
+    ``should_stop`` is cooperative (the caller keeps the partial reply). The
+    watcher exists so a socket blocked mid-chunk is unblocked instead of
+    waiting for the server or the request timeout.
+    """
+    while not done.wait(0.01):
+        if cancel is not None and _cancel_requested(cancel):
+            state["cancel"] = True
+            _abort_owned_stream(holder[0])
+            return
+        if should_stop is not None and _cancel_requested(should_stop):
+            state["stop"] = True
+            _abort_owned_stream(holder[0])
+            return
+
+
+def _post_chat(url: str, payload: Dict[str, Any], timeout_s: float,
+               cancel: Any = None) -> bytes:
+    """POST a chat payload, abortable when a cancel hook is supplied.
+
+    With no hook the exact ``urllib`` path is kept (byte-identical, and the
+    seam hermetic tests patch). A keyed turn supplies the hook, so its
+    blocking read runs on a socket the cancel watcher can shut down.
+    """
+    if cancel is None:
+        req = urllib.request.Request(
+            url, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            return resp.read()
+    if _cancel_requested(cancel):
+        raise LocalLlmCancelled("local model call cancelled")
+    holder = AbortableHTTPPost(
+        url, json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"}, timeout_s=timeout_s)
+    done = threading.Event()
+    watcher = threading.Thread(
+        target=_watch_cancel, args=(cancel, holder, done), daemon=True,
+        name="local-llm-cancel")
+    watcher.start()
+    try:
+        body = holder.post()
+        if _cancel_requested(cancel):
+            raise LocalLlmCancelled("local model call cancelled")
+        return body
+    finally:
+        done.set()
+        watcher.join(timeout=1.0)
+
+
+def post_json(url: str, payload: Dict[str, Any], timeout_s: float,
+              *, cancel: Any = None) -> bytes:
+    """Abortable JSON POST shared by the raw local adapters.
+
+    ``gateway._local_generate`` / ``_local_chat_raw`` currently inline their
+    own blocking ``urllib`` read. Routing that read through this seam with the
+    turn's ``cancel`` hook makes it abortable as well; with no hook the exact
+    ``urllib`` path is kept (byte-identical and patch-compatible).
+    """
+    return _post_chat(url, payload, timeout_s, cancel)
+
+
+class ReasoningInvalidError(ValueError):
+    """Unknown reasoning level: the caller must fail typed, never silently
+    substitute the default budget (a quiet substitution would lie about the
+    effort the operator selected)."""
+
+
+def normalize_reasoning_level(level: str | None) -> str | None:
+    """Validate a reasoning level; ``None`` (model default) passes through."""
+    if level is None:
+        return None
+    key = str(level).strip().lower()
+    if key not in REASONING_BUDGETS:
+        raise ReasoningInvalidError(
+            f"unknown reasoning level {level!r} "
+            f"(choose one of {sorted(REASONING_BUDGETS)})")
+    return key
+
+
+def resolve_reasoning_budget(level: str | None) -> int:
+    """Map a reasoning-effort level to a bounded output budget."""
+    if level is None:
+        return DEFAULT_REASONING_BUDGET
+    key = str(level).strip().lower()
+    if key not in REASONING_BUDGETS:
+        return DEFAULT_REASONING_BUDGET
+    return REASONING_BUDGETS[key]
+
+
+# Few-shot dialog examples (style teaching). Loaded from config/dialogs.md —
+# part of the SYSTEM prompt so it costs tokens once per turn, not per request.
+def _load_dialogs() -> str:
+    candidates = [
+        Path(os.path.expanduser("~/.config/qubit-voicebridge/dialogs.md")),
+        Path(os.path.expanduser("~/.config/qubit-voice-agent/dialogs.md")),
+        Path(os.path.expanduser("~/.config/openclaw-voice-bridge/dialogs.md")),
+        resources.resource_path("config/dialogs.md"),
+    ]
+    for p in candidates:
+        if p.exists():
+            try:
+                text = p.read_text(errors="replace")
+                start = text.find("DIALOG_EXAMPLES = ")
+                if start >= 0:
+                    text = text[start:].split('"""')[1]
+                return text.strip()
+            except Exception:
+                return ""
+    return ""
+
+
+_DIALOGS = _load_dialogs()
+
+if _DIALOGS:
+    SYSTEM_PROMPT = SYSTEM_PROMPT + "\n\n# Example dialogs (match this style)\n" + _DIALOGS
+
+# --- language guard (ENGLISH ONLY) -------------------------------------------
+# Common high-frequency English words — a real English reply is full of them.
+_EN_COMMON = {"the","be","to","of","and","a","in","that","have","i","it","for","not",
+              "on","with","he","as","you","do","at","this","but","his","by","from",
+              "they","we","say","her","she","or","an","will","my","one","all","would",
+              "there","their","what","so","up","out","if","about","who","get","which",
+              "go","me","when","make","can","like","time","no","just","him","know",
+              "take","people","into","year","your","good","some","could","them","see",
+              "other","than","then","now","look","only","come","its","over","think",
+              "also","back","after","use","two","how","our","work","first","well",
+              "way","even","new","want","because","any","these","give","day","most",
+              "is","are","yes"}
+def _reply_is_other_language(text: str) -> bool:
+    """True when the reply does NOT look like plain English (ENGLISH ONLY rule)."""
+    if not text:
+        return False
+    # Non-Latin / Romanian-diacritic scripts => not English.
+    for ch in text[:400]:
+        o = ord(ch)
+        if o > 0x24F:   # beyond Latin Extended-A (covers ă â ș ț î, Cyrillic, CJK…)
+            return True
+    low = text.lower()
+    tokens = [w.strip(".,!?;:'\"()[]") for w in low.split()]
+    tokens = [t for t in tokens if t.isalpha()]
+    if not tokens:
+        return False
+    en = sum(1 for t in tokens if t in _EN_COMMON)
+    # A genuine English reply contains common English words; foreign text almost
+    # none. Short replies (<4 tokens) can't be judged reliably -> allow.
+    if len(tokens) >= 4 and en == 0:
+        return True
+    if len(tokens) >= 6 and en <= 1:
+        return True
+    return False
+
+
+_THINK_BLOCK_RE = re.compile(r"\s* thinking\s*\n.*?\n\s* response|\s*thinking\s*\n.*?\n\s* response", re.S)
+_THINK_TAG_RE = re.compile(r"<{1,2}/?think>?", re.I)
+_THINK_TOKEN_RE = re.compile(r"/no_think|/think|\bno_think\b", re.I)
+_THINK_LEAD_RE = re.compile(r"^\s*(?:response|thinking|/think|no_think|<think)\b[^\w]*", re.I)
+
+
+def _strip_think(text: str) -> str:
+    """Remove reasoning artifacts from replies.
+
+    The abliterated quant sometimes ignores /no_think and emits a leading
+    ` thinking` / ` thinking` / ` response` / `/think` marker (and its
+    matching close tag); nothing here may reach TTS/dashboard.
+    """
+    import re as _re
+    text = text or ""
+    text = _re.sub(_THINK_BLOCK_RE, " ", text)
+    text = _re.sub(_THINK_TAG_RE, "", text)
+    text = _re.sub(_THINK_TOKEN_RE, "", text)
+    text = _re.sub(_THINK_LEAD_RE, "", text, count=1)
+    text = _re.sub(r"\s*\bresponse\b\s*$", "", text)
+    return text.strip()
+
+
+def _extract_reply(body: Dict[str, Any]) -> str:
+    """Pull the answer out of an /api/chat response — CONTENT ONLY.
+
+    Packet 4B reversal: under the /no_think template any text in
+    `message.thinking` is genuine chain-of-thought, never a speakable
+    answer. The old thinking-fallback would have read reasoning junk aloud,
+    so it is gone; an empty content is a typed failure for the caller's
+    bounded retry instead."""
+    msg = body.get("message", {}) or {}
+    reply = (msg.get("content") or "").strip()
+    if not reply and (msg.get("thinking") or "").strip():
+        log_event("conversation.local.thinking_only",
+                  chars=len(msg.get("thinking") or ""))
+    return _strip_think(reply)
+
+
+_COMPILER_CACHE: Dict[str, Any] = {}
+
+
+def _reset_compiler_cache() -> None:
+    """Test/diagnostic hook: rebuild the configured compiler next call.
+
+    Closes the cached ``MemoryStore`` before dropping it. The compiler holds
+    an open ``sqlite3.Connection``; clearing the dict alone orphaned it, and
+    the connection was then finalised by the GC during whatever ran next —
+    surfacing as "ResourceWarning: unclosed database" on an unrelated test.
+    """
+    compiler = _COMPILER_CACHE.get("compiler")
+    store = getattr(compiler, "store", None)
+    closer = getattr(store, "close", None)
+    if callable(closer):
+        try:
+            closer()
+        except Exception:  # noqa: BLE001 - teardown must not raise
+            pass
+    _COMPILER_CACHE.clear()
+
+
+def _evidence_provider(names: List[str]):
+    """Bounded parallel evidence provider over the 5A read-only registry."""
+    from .evidence import build_evidence_registry
+    from .context import parallel_evidence
+    reg = build_evidence_registry()
+
+    def provider(query: str, max_workers: int, deadline_s: float):
+        def one(name: str, q: str):
+            return reg.fetch(name, q)
+        return parallel_evidence(one, names, lambda n: query[:200],
+                                 max_workers, deadline_s)
+
+    return provider
+
+
+def _configured_compiler() -> tuple:
+    """Resolve the chat-path compiler once per process.
+
+    intent.compiler.mode = "5c" (default) uses the Packet 5C bounded
+    compiler wired to the FTS5 memory store + bounded evidence;
+    "4b" restores the Packet 4B compiler (rollback flag).
+    Env overrides (tests/diagnostics):
+      VOICE_BRIDGE_MEMORY_DB, VOICE_BRIDGE_COMPILER_MODE.
+    """
+    if _COMPILER_CACHE:
+        return (_COMPILER_CACHE["mode"], _COMPILER_CACHE["compiler"],
+                _COMPILER_CACHE["observe"])
+    mode = os.environ.get("VOICE_BRIDGE_COMPILER_MODE") or "5c"
+    observe = True
+    sources: List[str] = []
+    try:
+        from .config import Config
+        cfg = Config.load()
+        mode = os.environ.get("VOICE_BRIDGE_COMPILER_MODE") or str(
+            cfg.get("intent", "compiler", "mode", default="5c"))
+        sources = list(cfg.get("intent", "compiler", "evidence_sources",
+                               default=[]) or [])
+        observe = bool(cfg.get("intent", "compiler", "observe",
+                               default=True))
+    except Exception:
+        pass
+    compiler = None
+    if mode == "5c":
+        try:
+            db_env = os.environ.get("VOICE_BRIDGE_MEMORY_DB")
+            db_path = Path(db_env) if db_env else None
+            if db_path is None:
+                from .config import Config as _C2
+                mem_dir = _C2.load().state_dir() / "memory"
+                mem_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.chmod(mem_dir, 0o700)
+                except OSError:
+                    pass
+                db_path = mem_dir / "memory.db"
+            from .memory import MemoryStore
+            from .context import ContextCompiler
+            store = MemoryStore(db_path)
+            provider = _evidence_provider(sources) if sources else None
+            compiler = ContextCompiler(store=store,
+                                       evidence_provider=provider,
+                                       max_tokens=4096,
+                                       output_reserve_tokens=150)
+        except Exception as exc:
+            from .logging_setup import log_event
+            log_event("compiler.5c.build.failed", error=str(exc)[:160])
+            compiler = None
+    _COMPILER_CACHE.update({"mode": mode, "compiler": compiler,
+                            "observe": observe})
+    from .logging_setup import log_event
+    log_event("compiler.mode", mode=mode,
+              active_compiler=("5c" if compiler is not None else "4b"))
+    return mode, compiler, observe
+
+
+def _compile_4b(text: str, conversation_prompt: str, context: str,
+                num_ctx: int, max_tokens: int,
+                include_core_facts: bool = True) -> str:
+    """Packet 4B compiler path (rollback + diagnostics, unchanged)."""
+    from .context_compiler import (ACTIVE_MAX_CHARS, CORE_FACTS_MAX_CHARS,
+                                   RECALL_MAX_CHARS, compile_context,
+                                   fits_budget, load_core_facts)
+    if include_core_facts and not (context or "").strip():
+        context = load_core_facts()
+    compiled = compile_context(
+        persona="", active=conversation_prompt or "",
+        core_facts=context or "", recall="",
+        char_budget=max(ACTIVE_MAX_CHARS + CORE_FACTS_MAX_CHARS, 2000))
+    if not fits_budget(num_ctx, max_tokens, compiled):
+        from .logging_setup import log_event
+        log_event("runner.context.overflow",
+                  est_tokens=compiled.est_tokens, num_ctx=num_ctx)
+    parts = []
+    if compiled.sections_included and "active" in compiled.sections_included \
+            and compiled.text.startswith("[active]"):
+        blocks = compiled.text.split("\n\n")
+        active_prefix = "[active]\n"
+        for b in blocks:
+            if b.startswith(active_prefix):
+                parts.append("Recent conversation:\n"
+                             + b[len(active_prefix):])
+            elif b.startswith("<about-the-user>"):
+                parts.append(b)
+            elif b.startswith("[reference]\n"):
+                parts.append(b)
+    else:
+        if conversation_prompt:
+            parts.append(f"Recent conversation:\n"
+                         f"{conversation_prompt[:ACTIVE_MAX_CHARS]}")
+        if context:
+            parts.append(f"<about-the-user>\n"
+                         f"{context[:RECALL_MAX_CHARS]}\n</about-the-user>")
+    return "\n\n".join(parts)
+
+
+def _compile_5c(text: str, conversation_prompt: str, context: str,
+                compiler, observe: bool) -> str:
+    """Packet 5C path: FTS5 recall + core facts + bounded evidence inside
+    the LIVE chat user turn. Falls back to 4B on any compiler error."""
+    from .context_compiler import CORE_FACTS_MAX_CHARS
+    from .logging_setup import log_event
+    try:
+        turn = compiler.compile(
+            text, scope="default", persona=SYSTEM_PROMPT,
+            active=conversation_prompt or "", tools="",
+            render_persona_tools=False)
+    except Exception as exc:
+        log_event("compiler.5c.compile.failed", error=str(exc)[:120])
+        return _compile_4b(text, conversation_prompt, context, 4096, 100)
+    body = turn.text
+    if context and context.strip():
+        body = (f"[instructions]\n{context[:CORE_FACTS_MAX_CHARS]}\n\n"
+                + body)
+    from .logging_setup import log_event as _le
+    _le("compiler.5c.turn", sections=turn.report.sections_included,
+        ms=turn.report.retrieval_ms, est=turn.est_tokens,
+        failures=len(turn.report.failures),
+        omitted=len(turn.report.omitted))
+    if observe and (turn.report.failures or turn.report.omitted):
+        trailer = (f"\n[ctx: ms={turn.report.retrieval_ms} "
+                   f"omitted={len(turn.report.omitted)} "
+                   f"ev_fail={len(turn.report.failures)} "
+                   f"~{turn.est_tokens}tok]")
+        log_event("compiler.5c.observability",
+                  omitted=len(turn.report.omitted),
+                  failures=len(turn.report.failures),
+                  ms=turn.report.retrieval_ms, est=turn.est_tokens)
+        body += trailer
+    return body
+
+
+def _user_content(text: str, conversation_prompt: str, context: str,
+                  num_ctx: int, max_tokens: int,
+                  include_core_facts: bool = True) -> str:
+    """Compiled user turn for the live chat path (Packet 5C).
+
+    mode "5c" (default): bounded compiler with FTS5 recall + core facts +
+    bounded evidence + citations; persona/tools stay in the separate system
+    message (immutable); retrieval only appends quoted reference blocks, so
+    injected text cannot change policy, tools, persona or routing.
+    mode "4b": exact Packet 4B behavior (rollback flag).
+    include_core_facts=False requests TRUE context absence (diagnostics).
+    """
+    mode, compiler, observe = _configured_compiler()
+    if compiler is not None and include_core_facts:
+        user_content = _compile_5c(text, conversation_prompt, context,
+                                   compiler, observe)
+    else:
+        user_content = _compile_4b(text, conversation_prompt, context,
+                                   num_ctx, max_tokens,
+                                   include_core_facts=include_core_facts)
+    user_content += "\n\n" if user_content else ""
+    # ENGLISH ONLY (user decision): no Romanian, no other language. The guard
+    # below retries if the model drifts out of English.
+    user_content += (
+        "Reply ONLY in plain English. Do NOT reply in any other language.\n"
+        "FACTS OVERRIDE HISTORY: the <about-the-user> facts above are ALWAYS true. "
+        "If older conversation turns contain a different or refusing answer "
+        "(e.g. \"I'm not capable\"), correct it now with the real fact and do not repeat the old mistake."
+    )
+    # Packet 4B repair round: Qwen3 soft no-think switch — this quant honors
+    # it ONLY as a literal in the user turn text, so the shared payload
+    # builder appends it (template/system-side insertion proved unreliable).
+    # Ceiling: the FULL assembled turn (context + instructions + question) is
+    # bounded here — the one choke point shared by both payload paths — so an
+    # oversized prompt is trimmed (context first, question kept) instead of
+    # reaching a provider/runner that would reject it and kill the session.
+    return _trim_prompt_keep_question(user_content + f"\nUser: {text} /no_think",
+                                      text)
+
+
+_STYLE_CACHE: Dict[str, Any] = {}
+
+
+def reset_style_cache() -> None:
+    """Forget the cached (temperature, think) snapshot.
+
+    Called after an ``intent.local_llm.*`` settings PUT so new turns use the
+    fresh values with no restart; clears the lazy snapshot only, never
+    in-flight state.
+    """
+    _STYLE_CACHE.clear()
+    from .context_compiler import _reset_compiler_cache as _drop_compiler
+    try:
+        _drop_compiler()
+    except Exception:  # noqa: BLE001 - style reset must not raise
+        pass
+
+
+def _local_style() -> "tuple[float, bool]":
+    """(temperature, think) for local chat from ``intent.local_llm.*``.
+
+    Cached per process and invalidated by :func:`reset_style_cache` (wired
+    to the settings PUT path), so a config change takes effect on the next
+    turn without a service restart. Config is the authority, not a literal;
+    defaults keep the varied, no-chain-of-thought voice behaviour when the
+    keys are absent.
+    """
+    cached = _STYLE_CACHE.get("v")
+    if cached is not None:
+        return cached
+    temp, think = 0.7, False
+    try:
+        from .config import Config
+        cfg = Config.load()
+        temp = float(cfg.get("intent", "local_llm", "temperature",
+                             default=0.7) or 0.7)
+        think = bool(cfg.get("intent", "local_llm", "think", default=False))
+    except Exception:  # noqa: BLE001 - defaults are safe
+        pass
+    _STYLE_CACHE["v"] = (temp, think)
+    return temp, think
+
+
+def _max_prompt_chars() -> int:
+    """Ceiling (chars) for the FULL assembled local user turn.
+
+    ``intent.local_llm.max_prompt_chars`` (default 8000). Read per call — a
+    config edit takes effect on the next turn with no restart — and never
+    cached in :data:`_STYLE_CACHE`, which only holds the style snapshot.
+    A malformed or non-positive value falls back to the default so a typo can
+    neither disable the ceiling nor wedge a turn.
+    """
+    from .config import DEFAULT_MAX_PROMPT_CHARS
+    try:
+        from .config import Config
+        raw = Config.load().get("intent", "local_llm", "max_prompt_chars",
+                                default=DEFAULT_MAX_PROMPT_CHARS)
+        value = int(raw)
+    except Exception:  # noqa: BLE001 - the default is safe
+        return DEFAULT_MAX_PROMPT_CHARS
+    return value if value > 0 else DEFAULT_MAX_PROMPT_CHARS
+
+
+def _trim_prompt_keep_question(user_content: str, text: str) -> str:
+    """Enforce the ceiling on an assembled user turn, preserving the question.
+
+    The turn is ``[compiled context + instructions] + "\\nUser: {text} /no_think"``.
+    ``text`` was already bounded upstream (chat_transport MAX_TEXT_CHARS), so
+    the CONTEXT portion is what can push the assembly over a provider's limit.
+    When the whole string exceeds ``_max_prompt_chars()`` the context head is
+    dropped and the user's own tail kept intact, with a marker saying how much
+    was dropped. Under the ceiling the string is returned unchanged
+    (byte-for-byte).
+    """
+    limit = _max_prompt_chars()
+    original = len(user_content)
+    if original <= limit:
+        return user_content
+    tail = "\nUser: " + text + " /no_think"
+    if user_content.endswith(tail):
+        head = user_content[: original - len(tail)]
+    else:
+        # Unknown shape: keep the ceiling authoritative rather than guess.
+        head = user_content[:original]
+        tail = ""
+    keep = limit - len(tail)
+    if keep <= min(200, len(head)):
+        # The question alone already fills the budget: the ceiling wins, the
+        # question is cut — logging it makes that visible instead of silent.
+        trimmed = (head + tail)[:limit]
+        dropped = original - len(trimmed)
+    else:
+        marker = "\n[... context trimmed ...]"
+        keep = max(0, keep - len(marker))
+        dropped = len(head) - keep
+        trimmed = head[:keep] + marker + tail
+    log_event("runner.prompt.trimmed", original_chars=original,
+              sent_chars=len(trimmed), limit=limit,
+              context_dropped_chars=dropped, question_chars=len(text))
+    return trimmed
+
+
+def _chat_payload(text: str, conversation_prompt: str, model: str,
+                  max_tokens: int, context: str, stream: bool,
+                  num_ctx: Optional[int] = None) -> Dict[str, Any]:
+    # Packet 4B: ONE canonical runner contract. num_ctx resolves from the
+    # contract (never a per-caller literal); keep_alive is always -1 so no
+    # caller can expire the resident runner.
+    if num_ctx is None:
+        from .runner_contract import resolve
+        num_ctx = resolve().num_ctx
+    temperature, think = _local_style()
+    return {
+        "model": model,
+        "stream": stream,
+        "keep_alive": -1,          # canonical contract: always resident
+        # Thinking models otherwise leak their chain-of-thought into the reply
+        # (and burn the token budget); voice answers must be just the answer.
+        # Configurable via intent.local_llm.think.
+        "think": think,
+        "options": {"num_predict": max_tokens, "temperature": temperature,
+                    "num_ctx": num_ctx,
+                    "top_p": 0.9},
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": _user_content(
+                text, conversation_prompt, context, num_ctx, max_tokens)},
+        ],
+    }
+
+
+def chat_local(text: str, conversation_prompt: str = "",
+               model: str = "qubit-brain", url: str = "http://127.0.0.1:11434",
+               timeout_s: float = 4.0, max_tokens: int = 100,
+               context: str = "", num_ctx: Optional[int] = None,
+               reasoning: Optional[str] = None, cancel: Any = None) -> str:
+    """Return a short local reply, or "" on any failure (caller falls back).
+
+    `context` = personal knowledge (MEMORY.md, personal-knowledge.md) the
+    model should use when answering about the user's world.
+
+    `reasoning` (None/minimal/low/medium/high/max) selects a per-request
+    output budget only — never runner options, so the resident model is
+    never reloaded. Unknown levels fail closed to the default budget.
+
+    `cancel` (callable -> bool, or an Event) is the turn's STOP hook. When
+    supplied, the request runs over a socket this module owns and a watcher
+    shuts it down as soon as the hook fires, raising
+    :class:`LocalLlmCancelled` instead of waiting out ``timeout_s``. With no
+    hook the exact ``urllib`` path is kept, byte-identical.
+    """
+    if reasoning is not None:
+        max_tokens = resolve_reasoning_budget(reasoning)
+    payload = _chat_payload(text, conversation_prompt, model, max_tokens,
+                            context, stream=False, num_ctx=num_ctx)
+    t0 = __import__("time").time()
+    try:
+        body = json.loads(_post_chat(
+            f"{url}/api/chat", payload, timeout_s, cancel).decode())
+        reply = _extract_reply(body)
+    except LocalLlmCancelled:
+        log_event("conversation.local.cancelled", model=model)
+        raise
+    except Exception as exc:
+        log_event("conversation.local.failed", error=str(exc)[:160], model=model)
+        return ""
+    # Packet 4B: the abliterated quant samples an instant-EOS / think-exhausted
+    # empty turn occasionally even under /no_think. One BOUNDED retry — never
+    # a loop; a second consecutive empty returns "" for the caller's fallback.
+    if not reply:
+        if _cancel_requested(cancel):
+            raise LocalLlmCancelled("local model call cancelled")
+        log_event("conversation.local.empty_retry", model=model)
+        try:
+            body2 = json.loads(_post_chat(
+                f"{url}/api/chat", payload, timeout_s, cancel).decode())
+            reply = _extract_reply(body2)
+        except LocalLlmCancelled:
+            raise
+        except Exception as exc:
+            log_event("conversation.local.retry_failed", error=str(exc)[:120])
+    elapsed = __import__("time").time() - t0
+    # HARD LANGUAGE GUARD: the agent speaks ONLY English and Romanian. If the
+    # reply drifted into another language, retry ONCE with an explicit lock;
+    # if it still drifts, keep the retry (best effort) but log it.
+    if reply and _reply_is_other_language(reply):
+        if _cancel_requested(cancel):
+            raise LocalLlmCancelled("local model call cancelled")
+        log_event("conversation.local.lang_drift", lang="non-english", chars=len(reply),
+                  preview=reply[:80])
+        payload["messages"] = payload["messages"][:-1] + [
+            {"role": "user", "content": payload["messages"][-1]["content"] +
+             "\n[STRICT: answer in plain ENGLISH only. No other language.]"},
+        ]
+        try:
+            body2 = json.loads(_post_chat(
+                f"{url}/api/chat", payload, timeout_s, cancel).decode())
+            fixed = _extract_reply(body2)
+            if fixed and not _reply_is_other_language(fixed):
+                reply = fixed
+        except LocalLlmCancelled:
+            raise
+        except Exception as exc:
+            log_event("conversation.local.retry_failed", error=str(exc)[:120])
+    log_event("conversation.local", model=model, chars=len(reply),
+              elapsed_s=round(elapsed, 3))
+    return reply
+
+
+def chat_local_stream(text: str, conversation_prompt: str = "",
+                      model: str = "qubit-brain", url: str = "http://127.0.0.1:11434",
+                      timeout_s: float = 4.0, max_tokens: int = 100,
+                      context: str = "", on_sentence=None,
+                      should_stop=None, num_ctx: Optional[int] = None,
+                      reasoning: Optional[str] = None,
+                      cancel: Any = None) -> str:
+    """Stream a local reply; emit completed sentences via on_sentence(str)
+    as they arrive so TTS can start synthesizing while the model is still
+    generating (STEAL_LIST item 6 — pipeline overlap, ~0.3-0.5s faster turns).
+
+    Returns the full reply, or "" on any failure (caller falls back to the
+    non-streaming path / cloud).
+    ``should_stop`` = callable -> True stops the stream mid-generation
+    cooperatively: the live socket is shut down so a blocked chunk read does
+    not wait for the server, and the sentences already emitted are kept.
+    ``cancel`` = callable -> bool / Event: the turn's typed STOP hook. It also
+    shuts down the live socket and raises :class:`LocalLlmCancelled` instead of
+    returning a partial reply.
+    ``reasoning`` selects the same per-request output budget as
+    :func:`chat_local` so the streaming (default) path honors the selector
+    instead of silently dropping it.
+    """
+    if reasoning is not None:
+        max_tokens = resolve_reasoning_budget(reasoning)
+    if on_sentence is None:
+        return chat_local(text, conversation_prompt, model=model, url=url,
+                          timeout_s=timeout_s, max_tokens=max_tokens,
+                          context=context, reasoning=reasoning, cancel=cancel)
+    if cancel is not None and _cancel_requested(cancel):
+        raise LocalLlmCancelled("local model call cancelled")
+    payload = _chat_payload(text, conversation_prompt, model, max_tokens,
+                            context, stream=True, num_ctx=num_ctx)
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        f"{url}/api/chat",
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    t0 = __import__("time").time()
+    full = ""
+    buf = ""
+    emitted: List[str] = []
+
+    def _flush(sentence: str) -> None:
+        sentence = _strip_think(sentence)
+        if sentence:
+            emitted.append(sentence)
+            on_sentence(sentence)
+
+    state = {"cancel": False, "stop": False}
+    holder: List[Any] = [None]
+    done = threading.Event()
+    watcher: Optional[threading.Thread] = None
+    owned: Optional[AbortableHTTPStream] = None
+    if cancel is not None or should_stop is not None:
+        # A hook is supplied: own the socket so the watcher can shut it down
+        # mid-chunk. With no hook the exact urlopen path below is kept.
+        owned = AbortableHTTPStream(
+            f"{url}/api/chat", body,
+            headers={"Content-Type": "application/json"},
+            timeout_s=timeout_s)
+        holder[0] = owned
+        watcher = threading.Thread(
+            target=_watch_stream,
+            args=(cancel, should_stop, holder, state, done),
+            daemon=True, name="local-llm-stream-cancel")
+        watcher.start()
+
+    def _open() -> Any:
+        if owned is not None:
+            return owned.open()
+        return urllib.request.urlopen(req, timeout=timeout_s)
+
+    def _consume(lines: Any) -> bool:
+        """Parse NDJSON chunks; False when a cooperative stop ended the read."""
+        nonlocal buf, full
+        for raw in lines:
+            if cancel is not None and _cancel_requested(cancel):
+                raise LocalLlmCancelled("local model call cancelled")
+            if should_stop is not None and _cancel_requested(should_stop):
+                _flush(buf.strip())
+                return False
+            line = raw.decode("utf-8", "replace").strip()
+            if not line:
+                continue
+            try:
+                chunk = (json.loads(line).get("message", {}) or {})
+            except Exception:
+                continue
+            delta = chunk.get("content") or ""
+            if not delta and not chunk.get("done"):
+                # thinking models stream <think> text first: skip it, never speak it
+                continue
+            buf += delta
+            full += delta
+            while True:
+                m = re.search(r"[.!?…]\s*", buf)
+                if not m:
+                    break
+                sentence = buf[:m.end()].strip()
+                buf = buf[m.end():]
+                _flush(sentence)
+        _flush(buf.strip())
+        return True
+
+    def _cancelled_now() -> bool:
+        return state["cancel"] or _cancel_requested(cancel)
+
+    stopped = False
+    try:
+        try:
+            with _open() as resp:
+                holder[0] = resp
+                stopped = not _consume(resp)
+        except LocalLlmCancelled:
+            raise
+        except Exception as exc:
+            if _cancelled_now():
+                raise LocalLlmCancelled(
+                    "local model call cancelled") from exc
+            if state["stop"]:
+                stopped = True
+                _flush(buf.strip())
+            else:
+                log_event("conversation.local.stream_failed",
+                          error=str(exc)[:160], model=model)
+                # Speak-consistent partial: return ONLY what was actually
+                # emitted as sentences, never the un-spoken trailing fragment
+                # (caller falls back to the cloud path when nothing completed).
+                return " ".join(emitted).strip()
+        if (not stopped and not emitted and not full.strip()
+                and not _cancelled_now()
+                and not _cancel_requested(should_stop)):
+            # Packet 4B: instant-EOS / think-exhausted empty stream. One
+            # BOUNDED retry — safe here because nothing was emitted yet, so no
+            # partial speech can duplicate; a second consecutive empty returns
+            # "" for the caller's cloud fallback.
+            log_event("conversation.local.empty_retry", model=model, stream=True)
+            try:
+                with _open() as resp2:
+                    holder[0] = resp2
+                    stopped = not _consume(resp2)
+            except LocalLlmCancelled:
+                raise
+            except Exception as exc:
+                if _cancelled_now():
+                    raise LocalLlmCancelled(
+                        "local model call cancelled") from exc
+                if state["stop"]:
+                    _flush(buf.strip())
+                else:
+                    log_event("conversation.local.retry_failed",
+                              error=str(exc)[:120])
+        if _cancelled_now():
+            raise LocalLlmCancelled("local model call cancelled")
+    finally:
+        done.set()
+        if watcher is not None:
+            watcher.join(timeout=1.0)
+    log_event("conversation.local.stream", model=model, chars=len(full),
+              elapsed_s=round(__import__("time").time() - t0, 3))
+    return " ".join(emitted).strip()

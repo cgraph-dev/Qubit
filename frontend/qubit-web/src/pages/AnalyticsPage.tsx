@@ -1,0 +1,658 @@
+import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
+import {
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
+  BarChart3,
+  Brain,
+  Cpu,
+  RefreshCw,
+  TrendingUp,
+} from "lucide-react";
+import { api } from "@/lib/api";
+import type {
+  AnalyticsResponse,
+  AnalyticsDailyEntry,
+  AnalyticsModelEntry,
+  AnalyticsSkillEntry,
+} from "@/lib/api";
+import { timeAgo } from "@/lib/utils";
+import { Button } from "@nous-research/ui/ui/components/button";
+import { Spinner } from "@nous-research/ui/ui/components/spinner";
+import { Card, CardContent, CardHeader, CardTitle } from "@nous-research/ui/ui/components/card";
+import {
+  SettingsEmpty,
+  SettingsLoadingSkeleton,
+  SettingsPage,
+  SettingsRow,
+  SettingsSection,
+  SettingsStatus,
+  SettingsSummary,
+} from "@/components/console-ui";
+import { usePageHeader } from "@/contexts/usePageHeader";
+import { useI18n } from "@/i18n";
+import { PluginSlot } from "@/plugins";
+import { Link } from "react-router";
+
+const PERIODS = [
+  { label: "7d", days: 7 },
+  { label: "30d", days: 30 },
+  { label: "90d", days: 90 },
+] as const;
+
+const CHART_HEIGHT_PX = 160;
+
+function formatTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return String(n);
+}
+
+function formatDate(day: string): string {
+  try {
+    const d = new Date(day + "T00:00:00");
+    return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  } catch {
+    return day;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sorting
+// ---------------------------------------------------------------------------
+
+function useTableSort<T>(
+  data: T[],
+  defaultKey: keyof T & string,
+  defaultDir: "asc" | "desc" = "desc",
+) {
+  const [sortKey, setSortKey] = useState<string>(defaultKey);
+  const [sortDir, setSortDir] = useState<"asc" | "desc">(defaultDir);
+
+  const sorted = useMemo(() => {
+    return [...data].sort((a, b) => {
+      const aVal = a[sortKey as keyof T];
+      const bVal = b[sortKey as keyof T];
+      // Nulls always last regardless of direction
+      if (aVal === null || aVal === undefined) return 1;
+      if (bVal === null || bVal === undefined) return -1;
+      if (aVal === bVal) return 0;
+      const cmp = aVal > bVal ? 1 : -1;
+      return sortDir === "asc" ? cmp : -cmp;
+    });
+  }, [data, sortKey, sortDir]);
+
+  const toggle = useCallback(
+    (key: string) => {
+      if (key === sortKey) {
+        setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+      } else {
+        setSortKey(key);
+        setSortDir("desc");
+      }
+    },
+    [sortKey],
+  );
+
+  return { sorted, sortKey, sortDir, toggle };
+}
+
+function SortHeader({
+  label,
+  col,
+  sortKey,
+  sortDir,
+  toggle,
+  className,
+}: {
+  label: string;
+  col: string;
+  sortKey: string;
+  sortDir: "asc" | "desc";
+  toggle: (key: string) => void;
+  className?: string;
+}) {
+  const active = col === sortKey;
+  return (
+    <th
+      onClick={() => toggle(col)}
+      className={`cursor-pointer select-none ${className ?? ""}`}
+    >
+      <span className="inline-flex items-center gap-1.5 rounded px-1 -mx-1 py-0.5 hover:bg-muted/40 transition-colors">
+        {label}
+        {active ? (
+          sortDir === "asc" ? (
+            <ArrowUp className="h-3.5 w-3.5 text-foreground/80 shrink-0" />
+          ) : (
+            <ArrowDown className="h-3.5 w-3.5 text-foreground/80 shrink-0" />
+          )
+        ) : (
+          <ArrowUpDown className="h-3 w-3 text-text-tertiary shrink-0" />
+        )}
+      </span>
+    </th>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Charts and tables
+//
+// These are dense data surfaces; they keep their semantic table markup and
+// sit inside a `.settings-group` so the page still reads as one settings
+// surface. The chart card is a single group surface — no nested card chrome.
+// ---------------------------------------------------------------------------
+
+function TokenBarChart({ daily }: { daily: AnalyticsDailyEntry[] }) {
+  const { t } = useI18n();
+  if (daily.length === 0) return null;
+
+  const maxTokens = Math.max(
+    ...daily.map((d) => d.input_tokens + d.output_tokens),
+    1,
+  );
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-center gap-2">
+          <BarChart3 className="h-5 w-5 text-muted-foreground" />
+          <CardTitle className="text-base">
+            {t.analytics.dailyTokenUsage}
+          </CardTitle>
+        </div>
+        <div className="flex items-center gap-4 font-mondwest normal-case text-xs text-muted-foreground">
+          <div className="flex items-center gap-1.5">
+            <div
+              className="h-2.5 w-2.5"
+              style={{ backgroundColor: "var(--series-input-token)" }}
+            />
+            {t.analytics.input}
+          </div>
+          <div className="flex items-center gap-1.5">
+            <div
+              className="h-2.5 w-2.5"
+              style={{ backgroundColor: "var(--series-output-token)" }}
+            />
+            {t.analytics.output}
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent>
+        <div
+          className="flex items-end gap-[2px]"
+          style={{ height: CHART_HEIGHT_PX }}
+        >
+          {daily.map((d) => {
+            const total = d.input_tokens + d.output_tokens;
+            const inputH = Math.round(
+              (d.input_tokens / maxTokens) * CHART_HEIGHT_PX,
+            );
+            const outputH = Math.round(
+              (d.output_tokens / maxTokens) * CHART_HEIGHT_PX,
+            );
+            return (
+              <div
+                key={d.day}
+                className="flex-1 min-w-0 group relative flex flex-col justify-end"
+                style={{ height: CHART_HEIGHT_PX }}
+              >
+                <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 hidden group-hover:block z-10 pointer-events-none">
+                  <div className="font-mondwest normal-case bg-card border border-border px-2.5 py-1.5 text-xs text-foreground shadow-lg whitespace-nowrap">
+                    <div className="font-medium">{formatDate(d.day)}</div>
+                    <div>
+                      {t.analytics.input}: {formatTokens(d.input_tokens)}
+                    </div>
+                    <div>
+                      {t.analytics.output}: {formatTokens(d.output_tokens)}
+                    </div>
+                    <div>
+                      {t.analytics.total}: {formatTokens(total)}
+                    </div>
+                  </div>
+                </div>
+
+                <div
+                  className="w-full"
+                  style={{
+                    backgroundColor:
+                      "color-mix(in srgb, var(--series-input-token) 70%, transparent)",
+                    height: Math.max(inputH, total > 0 ? 1 : 0),
+                  }}
+                />
+
+                <div
+                  className="w-full"
+                  style={{
+                    backgroundColor:
+                      "color-mix(in srgb, var(--series-output-token) 70%, transparent)",
+                    height: Math.max(outputH, d.output_tokens > 0 ? 1 : 0),
+                  }}
+                />
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="flex justify-between mt-2 font-mondwest normal-case text-xs text-text-tertiary">
+          <span>{daily.length > 0 ? formatDate(daily[0].day) : ""}</span>
+          {daily.length > 2 && (
+            <span>{formatDate(daily[Math.floor(daily.length / 2)].day)}</span>
+          )}
+          <span>
+            {daily.length > 1 ? formatDate(daily[daily.length - 1].day) : ""}
+          </span>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function DailyTable({ daily }: { daily: AnalyticsDailyEntry[] }) {
+  const { t } = useI18n();
+  const { sorted, sortKey, sortDir, toggle } = useTableSort(daily, "day", "desc");
+
+  if (daily.length === 0) return null;
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-center gap-2">
+          <TrendingUp className="h-5 w-5 text-muted-foreground" />
+          <CardTitle className="text-base">
+            {t.analytics.dailyBreakdown}
+          </CardTitle>
+        </div>
+      </CardHeader>
+      <CardContent>
+        <div className="overflow-x-auto">
+          <table className="w-full font-mondwest normal-case text-sm">
+            <thead>
+              <tr className="border-b border-border text-muted-foreground text-xs">
+                <SortHeader label={t.analytics.date} col="day" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-left py-2 pr-4 font-medium" />
+                <SortHeader label={t.sessions.title} col="sessions" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 px-4 font-medium" />
+                <SortHeader label={t.analytics.input} col="input_tokens" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 px-4 font-medium" />
+                <SortHeader label={t.analytics.output} col="output_tokens" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 pl-4 font-medium" />
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.map((d) => (
+                <tr
+                    key={d.day}
+                    className="border-b border-border/50 hover:bg-secondary/20 transition-colors"
+                  >
+                  <td className="py-2 pr-4 font-medium">
+                      {formatDate(d.day)}
+                    </td>
+                  <td className="text-right py-2 px-4 text-muted-foreground">
+                      {d.sessions}
+                    </td>
+                  <td className="text-right py-2 px-4">
+                    <span style={{ color: "var(--series-input-token)" }}>
+                        {formatTokens(d.input_tokens)}
+                      </span>
+                  </td>
+                  <td className="text-right py-2 pl-4">
+                    <span style={{ color: "var(--series-output-token)" }}>
+                        {formatTokens(d.output_tokens)}
+                      </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function ModelTable({ models }: { models: AnalyticsModelEntry[] }) {
+  const { t } = useI18n();
+  const { sorted, sortKey, sortDir, toggle } = useTableSort(models, "input_tokens", "desc");
+
+  if (models.length === 0) return null;
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-center gap-2">
+          <Cpu className="h-5 w-5 text-muted-foreground" />
+          <CardTitle className="text-base">
+            {t.analytics.perModelBreakdown}
+          </CardTitle>
+        </div>
+      </CardHeader>
+      <CardContent>
+        <div className="overflow-x-auto">
+          <table className="w-full font-mondwest normal-case text-sm">
+            <thead>
+              <tr className="border-b border-border text-muted-foreground text-xs">
+                <SortHeader label={t.analytics.model} col="model" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-left py-2 pr-4 font-medium" />
+                <SortHeader label={t.sessions.title} col="sessions" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 px-4 font-medium" />
+                <SortHeader label={t.analytics.tokens} col="input_tokens" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 pl-4 font-medium" />
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.map((m) => (
+                <tr
+                  key={m.model}
+                  className="border-b border-border/50 hover:bg-secondary/20 transition-colors"
+                >
+                  <td className="py-2 pr-4">
+                    <span className="font-mono-ui text-xs">{m.model}</span>
+                  </td>
+                  <td className="text-right py-2 px-4 text-muted-foreground">
+                    {m.sessions}
+                  </td>
+                  <td className="text-right py-2 pl-4">
+                    <span style={{ color: "var(--series-input-token)" }}>
+                      {formatTokens(m.input_tokens)}
+                    </span>
+                    {" / "}
+                    <span style={{ color: "var(--series-output-token)" }}>
+                      {formatTokens(m.output_tokens)}
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function SkillTable({ skills }: { skills: AnalyticsSkillEntry[] }) {
+  const { t } = useI18n();
+  const { sorted, sortKey, sortDir, toggle } = useTableSort(skills, "total_count", "desc");
+
+  if (skills.length === 0) return null;
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-center gap-2">
+          <Brain className="h-5 w-5 text-muted-foreground" />
+          <CardTitle className="text-base">{t.analytics.topSkills}</CardTitle>
+        </div>
+      </CardHeader>
+      <CardContent>
+        <div className="overflow-x-auto">
+          <table className="w-full font-mondwest normal-case text-sm">
+            <thead>
+              <tr className="border-b border-border text-muted-foreground text-xs">
+                <SortHeader label={t.analytics.skill} col="skill" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-left py-2 pr-4 font-medium" />
+                <SortHeader label={t.analytics.loads} col="view_count" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 px-4 font-medium" />
+                <SortHeader label={t.analytics.edits} col="manage_count" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 px-4 font-medium" />
+                <SortHeader label={t.analytics.total} col="total_count" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 px-4 font-medium" />
+                <SortHeader label={t.analytics.lastUsed} col="last_used_at" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 pl-4 font-medium" />
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.map((skill) => (
+                <tr
+                  key={skill.skill}
+                  className="border-b border-border/50 hover:bg-secondary/20 transition-colors"
+                >
+                  <td className="py-2 pr-4">
+                    <span className="font-mono-ui text-xs">{skill.skill}</span>
+                  </td>
+                  <td className="text-right py-2 px-4 text-muted-foreground">
+                    {skill.view_count}
+                  </td>
+                  <td className="text-right py-2 px-4 text-muted-foreground">
+                    {skill.manage_count}
+                  </td>
+                  <td className="text-right py-2 px-4">{skill.total_count}</td>
+                  <td className="text-right py-2 pl-4 text-muted-foreground">
+                    {skill.last_used_at ? timeAgo(skill.last_used_at) : "—"}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Hidden state
+//
+// `dashboard.show_token_analytics` gates the whole page. The gate is not a
+// bare wall of prose: it is one settings section whose notice (`SettingsEmpty`)
+// carries the honest reason and whose row carries the action — a link to the
+// Config page where the flag can be flipped. No numbers are fabricated.
+// ---------------------------------------------------------------------------
+
+function HiddenState() {
+  return (
+    <SettingsSection
+      title="Token analytics"
+      description="Local token, session, and per-day figures for this profile. Local cost fields are never populated."
+      notice={
+        <SettingsEmpty title="Token analytics are hidden">
+          The numbers on this page are a local debug estimate, not provider
+          billing, so they are hidden rather than shown as if authoritative.
+        </SettingsEmpty>
+      }
+    >
+      <SettingsRow
+        title="What it counts"
+        description="Successful main-agent responses that carry a usable usage block. Nothing else."
+        control={<SettingsStatus tone="idle">Partial</SettingsStatus>}
+      />
+      <SettingsRow
+        title="What it excludes"
+        description="Auxiliary calls (compression, titles, vision, session search, web extract, approvals, MCP routing, plugin LLM), provider retries, and cache writes."
+        control={<SettingsStatus tone="warn">Incomplete</SettingsStatus>}
+      />
+      <SettingsRow
+        title="Why it is hidden"
+        description="On models with heavy auxiliary traffic (Kimi K2.6, MiniMax M2.7) the local total can read 10x–100x below your provider bill."
+        control={<SettingsStatus tone="error">Misleading</SettingsStatus>}
+      />
+      <SettingsRow
+        title="For actual usage"
+        description="Check your provider dashboard (OpenRouter, Anthropic, …) for real usage and billing."
+      />
+      <SettingsRow
+        title="Show local debug estimate"
+        description={
+          <>
+            Set <code className="font-mono">dashboard.show_token_analytics</code>{" "}
+            to <code className="font-mono">true</code> in Config to render the
+            local estimate anyway. In Config, search for{" "}
+            <code className="font-mono">show_token_analytics</code> or open the{" "}
+            <strong>Display</strong> category.
+          </>
+        }
+        control={
+          <Link
+            to="/config"
+            className="btn"
+            aria-label="Open Config to enable token analytics"
+          >
+            Open Config
+          </Link>
+        }
+      />
+    </SettingsSection>
+  );
+}
+
+export default function AnalyticsPage() {
+  const [days, setDays] = useState(30);
+  const [data, setData] = useState<AnalyticsResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  // Gated on `dashboard.show_token_analytics` (default off).  When off the
+  // page renders a settings section explaining the gate instead of fetching
+  // analytics — the local token counts exclude auxiliary calls and provider
+  // retries, so they diverge from provider billing in ways that mislead users.
+  const [showTokens, setShowTokens] = useState<boolean | null>(null);
+  const { t } = useI18n();
+  const { setAfterTitle, setEnd } = usePageHeader();
+
+  useEffect(() => {
+    api
+      .getConfig()
+      .then((cfg) => {
+        const dash = (cfg?.dashboard ?? {}) as { show_token_analytics?: unknown };
+        setShowTokens(dash.show_token_analytics === true);
+      })
+      .catch(() => setShowTokens(false));
+  }, []);
+
+  const load = useCallback(() => {
+    if (!showTokens) return;
+    setLoading(true);
+    setError(null);
+    api
+      .getAnalytics(days)
+      .then(setData)
+      .catch((err) => setError(String(err)))
+      .finally(() => setLoading(false));
+  }, [days, showTokens]);
+
+  useLayoutEffect(() => {
+    // Period selector + refresh both live in afterTitle so the controls
+    // sit immediately next to the page title instead of being pinned to
+    // the far-right `end` slot. The active period is conveyed by the
+    // filled (non-outlined) button — no redundant period badge.
+    setAfterTitle(
+      showTokens === false ? null : (
+        <div className="flex flex-wrap items-center gap-1.5">
+          {PERIODS.map((p) => (
+            <Button
+              key={p.label}
+              type="button"
+              size="sm"
+              outlined={days !== p.days}
+              onClick={() => setDays(p.days)}
+            >
+              {p.label}
+            </Button>
+          ))}
+          <Button
+            type="button"
+            ghost
+            size="icon"
+            className="text-muted-foreground hover:text-foreground"
+            onClick={load}
+            disabled={loading}
+            aria-label={t.common.refresh}
+          >
+            {loading ? <Spinner /> : <RefreshCw />}
+          </Button>
+        </div>
+      ),
+    );
+    setEnd(null);
+    return () => {
+      setAfterTitle(null);
+      setEnd(null);
+    };
+  }, [days, loading, load, setAfterTitle, setEnd, t.common.refresh, showTokens]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const isEmpty =
+    !!data &&
+    data.daily.length === 0 &&
+    data.by_model.length === 0 &&
+    data.skills.top_skills.length === 0;
+
+  // The full-page gate owns its own `.settings-page` wrapper.
+  if (showTokens === false) {
+    return (
+      <div className="settings-page settings-page--wide" data-testid="analytics-page">
+        <PluginSlot name="analytics:top" />
+        <HiddenState />
+        <PluginSlot name="analytics:bottom" />
+      </div>
+    );
+  }
+
+  return (
+    <SettingsPage wide>
+      <div data-testid="analytics-page" className="contents">
+        <PluginSlot name="analytics:top" />
+
+        {showTokens && loading && !data && (
+          <SettingsSection title={t.analytics.period}>
+            <SettingsLoadingSkeleton rows={4} />
+          </SettingsSection>
+        )}
+
+        {showTokens && error && (
+          <SettingsSection title="Token analytics">
+            <SettingsRow
+              title="Analytics failed to load"
+              description={error}
+              control={
+                <SettingsStatus tone="error" title={error}>
+                  Error
+                </SettingsStatus>
+              }
+            />
+          </SettingsSection>
+        )}
+
+        {showTokens && data && (
+          <>
+            <SettingsSection
+              title={t.analytics.period}
+              description={`Aggregate local estimate over the last ${days} days. Excludes auxiliary calls and retries — not provider billing.`}
+            >
+              <SettingsSummary
+                items={[
+                  {
+                    label: t.analytics.totalTokens,
+                    value: formatTokens(
+                      data.totals.total_input + data.totals.total_output,
+                    ),
+                  },
+                  {
+                    label: t.analytics.input,
+                    value: formatTokens(data.totals.total_input),
+                  },
+                  {
+                    label: t.analytics.output,
+                    value: formatTokens(data.totals.total_output),
+                  },
+                  {
+                    label: t.analytics.totalSessions,
+                    value: data.totals.total_sessions,
+                  },
+                  {
+                    label: t.analytics.apiCalls,
+                    value:
+                      data.totals.total_api_calls ??
+                      data.daily.reduce((sum, d) => sum + d.sessions, 0),
+                  },
+                ]}
+              />
+              {isEmpty ? (
+                <SettingsEmpty title={t.analytics.noUsageData}>
+                  {t.analytics.startSession}
+                </SettingsEmpty>
+              ) : null}
+            </SettingsSection>
+
+            <TokenBarChart daily={data.daily} />
+            <DailyTable daily={data.daily} />
+            <ModelTable models={data.by_model} />
+            <SkillTable skills={data.skills.top_skills} />
+          </>
+        )}
+
+        <PluginSlot name="analytics:bottom" />
+      </div>
+    </SettingsPage>
+  );
+}
